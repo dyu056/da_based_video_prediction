@@ -1,0 +1,82 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers,compress}{natbib}
+\usepackage{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+\title{Data Assimilation for Efficient Sparse-Conditioned Video Prediction in Latent Space}
+\author{Anonymous Author(s)}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We study whether data assimilation (DA) can improve the quality-compute tradeoff of sparse-conditioned sequential video prediction. Our framework separates a recognized video-prediction reference baseline from a lightweight latent sequential model that serves as the DA host, then uses ensemble Kalman style latent updates to correct forecasts under sparse observations. The final paper will report Moving MNIST results for the reference baseline, the open-loop DA host, always-assimilate correction, and selective-assimilation correction, with evaluation based on both prediction quality and uncertainty-aware compute metrics.
+\end{abstract}
+
+\section{Introduction}
+
+Modern sequential video models must balance quality, temporal consistency, and computational cost. This paper treats sparse-conditioned video prediction as a latent filtering problem and positions DA as the mechanism that adaptively corrects sequential forecasts when uncertainty is high.
+
+\section{Related Work}
+
+The final manuscript will connect three threads: latent and reduced-order DA, efficient sequential video prediction, and Bayesian warm-start ideas for modern generative models.
+
+\section{Problem Formulation}
+
+Let $x_t$ denote the frame at time $t$, $z_t$ its latent representation, $z_t^f$ the forecast state, and $z_t^a$ the analysis state. The core forecast-analysis loop is
+\begin{align}
+    z_t &= E(x_t), \\
+    z_t^{f} &= M_{\theta}(z_{t-1}^{a}) + \eta_t, \\
+    y_t &= H(x_t) + \epsilon_t, \\
+    z_t^{a} &= z_t^{f} + K_t \left(y_t - H(D(z_t^{f}))\right).
+\end{align}
+
+\section{Method}
+
+The final method section will describe three components:
+\begin{enumerate}[leftmargin=1.2em]
+    \item a literature-aware reference baseline (`SimVP`);
+    \item a lightweight latent sequential host model for DA;
+    \item a selective-assimilation policy driven by innovation, spread, or entropy.
+\end{enumerate}
+
+\section{Experimental Setup}
+
+The primary benchmark is Moving MNIST with a $10 \rightarrow 10$ prediction setup. The main comparison will include:
+\begin{enumerate}[leftmargin=1.2em]
+    \item `SimVP` reference baseline;
+    \item open-loop DA host model;
+    \item always-assimilate DA host model;
+    \item selective-assimilation DA host model.
+\end{enumerate}
+
+The final paper will report RMSE, PCC, entropy, relative entropy, mutual information, runtime, and refinement frequency.
+
+\section{Results}
+
+This section will be filled with the completed baseline replication and DA experiments. At the current project stage, the recognized `SimVP` baseline has already been replicated on the lab L40 server and will serve as the reference point for the DA comparisons.
+
+\section{Discussion}
+
+The final discussion will analyze whether DA improves the quality-compute tradeoff, whether selective correction is competitive with always-assimilate correction, and where latent-space DA breaks down under sparse observations.
+
+\section{Conclusion}
+
+This paper aims to show that DA can be used as adaptive latent filtering for efficient sparse-conditioned video prediction, with a focus on a clean experimental design that is both class-project-safe and paper-ready.
+
+\bibliographystyle{plainnat}
+\bibliography{project_references}
+
+\end{document}

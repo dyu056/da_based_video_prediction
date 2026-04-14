@@ -1,0 +1,14 @@
+name: da-video-l40
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pytorch
+  - pytorch-cuda=12.4
+  - numpy
+  - matplotlib
+  - scikit-learn
+  - pillow
+  - pip

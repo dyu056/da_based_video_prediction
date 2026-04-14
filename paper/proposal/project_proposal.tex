@@ -1,0 +1,184 @@
+\documentclass{article}
+
+\PassOptionsToPackage{numbers,compress}{natbib}
+\usepackage{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\setlength{\emergencystretch}{2em}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+% For a named draft outside submission, switch to:
+% \usepackage[preprint]{neurips_2026}
+
+\title{Data Assimilation for Efficient Sparse-Conditioned Video Prediction in Latent Space}
+
+\author{Anonymous Author(s)}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Video prediction and video generation systems are increasingly capable, but they remain expensive to run sequentially and brittle when conditioning information is sparse. We propose to treat sparse-conditioned video prediction as a latent-space filtering problem and to use data assimilation (DA) as the mechanism that updates a cheap forecast with partial observations. Our framework separates a recognized video-prediction reference baseline from a lightweight sequential latent predictor that serves as the DA host model. On top of that host, we use an ensemble Kalman style analysis step to assimilate keyframes, masked patches, or low-resolution measurements. The central hypothesis is that latent-space DA can improve the quality-compute tradeoff by warm-starting each time step from the previous analysis state, correcting only uncertain directions, and triggering expensive refinement only when the innovation or posterior uncertainty is large. We describe a practical implementation on Moving MNIST with an optional extension to KTH, along with an evaluation protocol that measures both forecast quality and uncertainty reduction.
+\end{abstract}
+
+\section{Introduction}
+
+Sequential video models face a persistent tradeoff between quality and compute. Diffusion-based generators often require many denoising or solver steps, while lighter recurrent or feed-forward video predictors can drift over long horizons, especially when observations are partial or noisy. This makes sparse-conditioned generation an appealing setting for Bayesian filtering ideas: the model can forecast the next latent state cheaply, then use newly available evidence to correct only the parts of the state that appear uncertain.
+
+Data assimilation (DA) provides exactly this forecast--analysis decomposition. In classical DA, a dynamics model produces a prior forecast, observations arrive through an observation operator, and an analysis update combines the two under uncertainty. This structure has been central in meteorology and oceanography, and recent work has highlighted a shared Bayesian foundation between DA and machine learning, especially in reduced-order latent spaces \citep{buizza2022data}. At the same time, warm-started conditional diffusion and Bayesian-filtering-inspired flow models suggest that carrying forward a good posterior can reduce generation cost substantially \citep{scholz2025warm, huang2026accelerated}.
+
+This paper adopts that perspective for sparse-conditioned video prediction. Instead of targeting full text-to-video generation, which would require substantially more engineering and compute, we focus on latent-space video prediction with occasional observations. This setting keeps the DA mathematics explicit while still testing the core claim that posterior-informed sequential generation can be faster than repeatedly refining from an uninformed prior.
+
+Our planned contributions are threefold:
+\begin{enumerate}[leftmargin=1.2em]
+    \item a latent-space state-space formulation of sparse-conditioned video prediction that makes the DA interpretation explicit;
+    \item a DA-assisted predictor that combines ensemble Kalman style latent updates with uncertainty-triggered selective refinement;
+    \item an experimental protocol that evaluates not only prediction error, but also uncertainty reduction and compute savings.
+\end{enumerate}
+
+\section{Related Work}
+
+Recent DA--ML literature provides a strong conceptual basis for this project. \citet{buizza2022data} emphasize the Bayesian unification of DA and ML, as well as the practical value of reduced-space methods. In generative DA, unconditional or conditional generative models can act as learned priors for state estimation, as demonstrated in realistic weather assimilation settings by \citet{manshausen2024generative}. Ensemble Kalman ideas have also recently been combined with diffusion priors for derivative-free inverse problems, suggesting that ensemble-based analysis updates can interact productively with pretrained generative models \citep{zheng2024ensemble}.
+
+Recent theoretical work also identifies an important caution. \citet{hodyss2025using} show that different diffusion-based DA systems can target different posteriors, and that exactly matching a classical DA posterior may become computationally awkward if retraining is required at every assimilation cycle. This observation motivates our choice to study DA-inspired correction around a fixed lightweight predictor rather than to replace the entire sequential model with a retrained diffusion process.
+
+The video literature points toward the same design pattern. MCVD formulates video prediction and interpolation through conditional video diffusion \citep{voleti2022mcvd}, while Latent-Shift shows that moving temporal generation into latent space can provide substantial efficiency gains \citep{an2023latentshift}. Simpler predictive baselines such as SimVP, TAU, and PredRNN++ remain strong reference points for video prediction benchmarks, which makes them good comparison targets for a DA-augmented sequential model.
+
+\section{Problem Formulation}
+
+Let $x_t \in \mathbb{R}^{H \times W}$ denote the true video frame at time $t$, and let $z_t \in \mathbb{R}^{d}$ denote a latent representation of that frame. We use an encoder--decoder pair
+\begin{align}
+    z_t &= E(x_t), \\
+    x_t &= D(z_t).
+\end{align}
+
+The sequential latent forecast model is
+\begin{equation}
+    z_t^{f} = M_{\theta}(z_{t-1}^{a}) + \eta_t,
+\end{equation}
+where $z_t^{f}$ is the forecast latent state, $z_{t-1}^{a}$ is the previous analysis state, $M_{\theta}$ is a learned latent dynamics model, and $\eta_t$ captures model uncertainty.
+
+Observations arrive through
+\begin{equation}
+    y_t = H(x_t) + \epsilon_t,
+\end{equation}
+where $H$ is an observation operator and $\epsilon_t$ is observation noise. In our experiments, $H$ may expose full keyframes, masked patches, downsampled frames, or noisy measurements.
+
+We then perform an ensemble Kalman style latent analysis update:
+\begin{equation}
+    z_t^{a} = z_t^{f} + K_t \left( y_t - H(D(z_t^{f})) \right),
+\end{equation}
+with Kalman gain
+\begin{equation}
+    K_t = P_t^{f} H_t^{\top} \left( H_t P_t^{f} H_t^{\top} + R_t \right)^{-1}.
+\end{equation}
+Here $P_t^{f}$ is the forecast covariance estimated from the latent ensemble and $R_t$ is the observation noise covariance. This gives a clean Bayesian filtering interpretation: forecast cheaply in latent space, decode to compare with observations, then correct the latent state before continuing the rollout.
+
+\section{Method}
+
+\subsection{Latent Forecast Model}
+
+The framework uses two model roles. First, a recognized predictor such as SimVP serves as a literature-aware reference baseline. Second, a lightweight sequential latent model operates on encoded video states and serves as the process model inside the DA loop. The initial DA host implementation uses a compact autoencoder and a recurrent or convolutional latent transition model so that the forecast step remains cheap and controllable.
+
+\subsection{Latent Analysis Update}
+
+At each predicted time step, we propagate an ensemble of latent states, decode the resulting forecast into observation space, compare the forecasted observation with the available measurement, and apply an ETKF or EnKF update in latent space. Assimilating in latent space follows classical reduced-order DA logic and should improve numerical stability by lowering the state dimension while preserving the state variables most relevant to future prediction.
+
+\subsection{Selective Refinement as the Speed Mechanism}
+
+The main efficiency idea is not merely to add DA, but to use DA to decide when expensive correction is worth paying for. Cheap latent propagation is always performed. More expensive refinement is invoked only when one or more uncertainty indicators are large, such as:
+\begin{itemize}[leftmargin=1.2em]
+    \item the innovation norm $\lVert y_t - H(D(z_t^{f})) \rVert$,
+    \item the forecast ensemble spread,
+    \item the entropy of the predictive latent distribution.
+\end{itemize}
+This creates a compute-aware policy: if the forecast already agrees with the available evidence, we keep rolling forward; if disagreement or uncertainty is high, we trigger a stronger correction.
+
+\section{Experimental Plan}
+
+\subsection{Datasets and Prediction Task}
+
+The primary benchmark is Moving MNIST because it is lightweight, controlled, and standard for video prediction. The default task uses the first $10$ frames as context and predicts the next $10$ frames. If the pipeline stabilizes early, we will extend the study to KTH human action videos to test whether the conclusions survive beyond synthetic trajectories.
+
+\subsection{Observation Regimes}
+
+We will compare several sparse-conditioning regimes:
+\begin{enumerate}[leftmargin=1.2em]
+    \item prefix-only prediction, where future frames are predicted after an observed prefix with no further measurements;
+    \item periodic keyframe assimilation, where one full frame is observed every $k$ time steps;
+    \item masked observation assimilation, where only selected pixels or patches are observed;
+    \item low-resolution assimilation, where downsampled frames are provided;
+    \item noisy observation assimilation, where the measurements are corrupted by Gaussian noise.
+\end{enumerate}
+
+\subsection{Baselines}
+
+The baseline comparisons will include:
+\begin{enumerate}[leftmargin=1.2em]
+    \item a literature-aware predictor baseline such as SimVP, TAU, or PredRNN++;
+    \item open-loop latent prediction on the DA host model without assimilation after the observed prefix;
+    \item an always-refine variant of the DA host that applies correction at every predicted step;
+    \item the proposed DA-assisted selective-refinement method on the same DA host;
+    \item an optional dense-observation upper bound used only for analysis.
+\end{enumerate}
+
+\subsection{Evaluation}
+
+We will report both quality and uncertainty metrics. The main frame-level accuracy measures are RMSE and pattern correlation coefficient (PCC). To characterize the ensemble dynamics, we will also measure predictive entropy, relative entropy between forecast and analysis distributions, and mutual information between the observations and the latent or decoded state. Because the central claim is about acceleration, we will additionally report wall-clock runtime, the number of expensive refinement calls, and quality-versus-compute tradeoff curves.
+
+\section{Anticipated Outcomes and Risks}
+
+The expected outcome is a predictor that preserves or improves forecast quality under sparse conditioning while reducing the amount of expensive correction needed during rollout. The most informative negative outcome would be equally valuable: if latent-space DA fails to improve the quality-compute tradeoff, that would clarify where classical filtering ideas break down for modern video models.
+
+The main risks are training instability, weak latent updates, and a mismatch between reduced frame error and actual compute savings. We will mitigate these risks by starting with a deterministic predictor, keeping the latent dimension small, matching methods under comparable accuracy budgets, and testing both dense and sparse observation schedules before moving to more ambitious settings.
+
+\section{Conclusion}
+
+This draft positions data assimilation as a principled mechanism for efficient sparse-conditioned video prediction. By treating video rollout as a latent-space filtering problem, the proposed method connects classical forecast--analysis updates with modern sequential generative modeling. The resulting system is modest enough to build within the current project timeline, but ambitious enough to test a meaningful hypothesis about the role of DA in efficient video generation.
+
+\bibliographystyle{plainnat}
+\bibliography{project_references}
+
+\appendix
+
+\section{Project Scope and Timeline}
+
+The minimum viable version consists of one dataset (Moving MNIST), one lightweight latent predictor, one DA method (EnKF or ETKF), two observation settings, and the main uncertainty-aware evaluation metrics. This scope is small enough to complete within the remaining project window while still supporting a coherent paper draft.
+
+\begin{table}[h]
+    \centering
+    \begin{tabular}{ll}
+        \toprule
+        Week & Main goal \\
+        \midrule
+        1 & Finalize scope, prepare data, and stabilize the baseline predictor \\
+        2 & Train the open-loop and literature baselines and establish runtime benchmarks \\
+        3 & Implement latent-space ensemble forecast and EnKF or ETKF analysis \\
+        4 & Test sparse-observation settings and tune latent dimension and ensemble size \\
+        5 & Add uncertainty-triggered selective refinement and compute-aware evaluation \\
+        6 & Measure entropy, relative entropy, and mutual information; prepare figures \\
+        7 & Extend to KTH if time permits and polish the paper draft \\
+        8 & Final analysis, report cleanup, and presentation preparation \\
+        \bottomrule
+    \end{tabular}
+    \caption{Eight-week execution plan for the dual-use class project and paper draft.}
+    \label{tab:timeline}
+\end{table}
+
+\end{document}
