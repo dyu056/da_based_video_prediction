@@ -15,16 +15,35 @@
 \usepackage{graphicx}
 \setlength{\emergencystretch}{2em}
 
-\title{Project Proposal: Latent-Space Data Assimilation for Sparse-Conditioned Video Prediction}
-\author{Anonymous Author(s)}
+\title{Course Final Project Proposal: Latent-Space Data Assimilation for Sparse-Conditioned Video Prediction}
+\author{Daniel Yu}
 
 \begin{document}
 
 \maketitle
 
 \begin{abstract}
-This proposal studies whether data assimilation (DA) can improve sequential video prediction when only sparse observations are available after the observed prefix. The central idea is that long-horizon video prediction is an unstable extrapolation problem: model errors accumulate unless the prediction is repeatedly re-anchored to reality. We propose to formulate video rollout as a latent-space forecast--analysis process, train a lightweight open-loop predictor as the DA host model, and apply latent ensemble Kalman updates whenever sparse observations become available. The initial study will focus on Moving MNIST with simulated noisy observations derived from held-out future frames. The project will evaluate both prediction quality and DA-specific uncertainty metrics, including RMSE, PCC, entropy, relative entropy, and mutual information. The main expected outcome is a clear demonstration of how assimilation changes the accuracy and uncertainty of sequential video prediction, together with a principled discussion of when DA helps and when it becomes computationally expensive.
+This proposal targets the course final project requirement for a substantial Python-based machine learning system. The project studies whether data assimilation (DA) can improve sequential video prediction when only sparse observations are available after the observed prefix. The central idea is that long-horizon video prediction is an unstable extrapolation problem: model errors accumulate unless the prediction is repeatedly re-anchored to reality. We propose to formulate video rollout as a latent-space forecast--analysis process, train a lightweight open-loop predictor as the DA host model, and apply latent ensemble Kalman updates whenever sparse observations become available. The initial study will focus on Moving MNIST with simulated noisy observations derived from held-out future frames. The project will evaluate both prediction quality and DA-specific uncertainty metrics, including RMSE, PCC, entropy, relative entropy, and mutual information. The main expected outcome is a clear demonstration of how assimilation changes the accuracy and uncertainty of sequential video prediction, together with a principled discussion of when DA helps and when it becomes computationally expensive.
 \end{abstract}
+
+\section{Project Topic and Team}
+
+\paragraph{Project topic.}
+This project belongs to the course's \emph{deep learning / sequence prediction} category. It studies sparse-conditioned video prediction and asks whether a learned video predictor can be improved by latent-space data assimilation.
+
+\paragraph{Team members.}
+This proposal is written for an \emph{individual project}.
+\begin{itemize}[leftmargin=1.2em]
+    \item Daniel Yu --- problem formulation, model implementation, experiments, analysis, and final presentation.
+\end{itemize}
+
+\paragraph{Project type.}
+The project matches the course expectation that students either implement and improve an algorithm from research or design their own computational method. Here the plan is to implement a complete Python pipeline that combines:
+\begin{enumerate}[leftmargin=1.2em]
+    \item a neural video predictor,
+    \item a latent-space ensemble Kalman update,
+    \item an experimental evaluation framework with reproducible metrics and visualizations.
+\end{enumerate}
 
 \section{Motivation}
 
@@ -70,6 +89,25 @@ This project sits at the intersection of machine learning and control-inspired s
 \end{enumerate}
 
 The machine-learning aspect is therefore not only the use of a neural network. It is also the study of how learned latent representations interact with uncertainty-aware sequential inference. The proposed experiments ask whether a learned predictor can be made more stable by combining it with structured probabilistic updates rather than relying on purely feed-forward or recurrent rollout alone.
+
+\section{Course Requirement Fit}
+
+This proposal is designed to align directly with the final-project instruction sheet:
+\begin{enumerate}[leftmargin=1.2em]
+    \item it addresses a meaningful deep-learning prediction problem,
+    \item it proposes a clear technical solution with both modeling and experimental depth,
+    \item it is fully Python-based and suitable for clean code submission,
+    \item it is scoped so that the final deliverables can include code, documentation, results under different settings, and presentation-ready visualizations.
+\end{enumerate}
+
+More concretely, the project will produce the kinds of artifacts the course asks for at the end of the semester:
+\begin{itemize}[leftmargin=1.2em]
+    \item organized Python source code,
+    \item environment specification for reproducibility,
+    \item written documentation of the architecture and method,
+    \item experimental results and screenshots/plots showing the code running,
+    \item a concise presentation summarizing the main ideas and findings.
+\end{itemize}
 
 \section{Proposed Method}
 
