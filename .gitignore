@@ -9,3 +9,9 @@ outputs/
 
 slurm_*.out
 slurm_*.err
+
+*.aux
+*.bbl
+*.blg
+*.log
+*.out

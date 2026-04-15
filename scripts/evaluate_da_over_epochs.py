@@ -19,7 +19,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from da_video.assimilation import etkf_update, mean_state, sample_state_ensemble, state_to_matrix
 from da_video.data import MovingMNISTDataset
-from da_video.metrics import pattern_correlation, rmse
+from da_video.metrics import (
+    gaussian_entropy_diag,
+    gaussian_mutual_information_diag,
+    gaussian_relative_entropy_diag,
+    pattern_correlation,
+    rmse,
+)
 from da_video.models import OpenLoopVideoPredictor
 from da_video.observation import SparseObservationOperator
 
@@ -123,7 +129,7 @@ def run_assimilated_rollout(
     latent_noise: float,
     hidden_noise: float,
     cell_noise: float,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor | float]:
     base_state, _ = model.initialize_state(context)
     ensemble_state = sample_state_ensemble(
         base_state,
@@ -133,14 +139,26 @@ def run_assimilated_rollout(
         cell_noise_std=cell_noise,
     )
     pred_frames = []
+    entropy_values = []
+    relative_entropy_values = []
+    mutual_information_values = []
+    innovation_values = []
+    spread_values = []
+    observed_steps = 0
+
     for step_idx in range(future.shape[1]):
         forecast_state, step_outputs = model.forecast_step(ensemble_state)
+        forecast_matrix = state_to_matrix(forecast_state)
+        forecast_var = forecast_matrix.var(dim=0, unbiased=False)
+        entropy_values.append(float(gaussian_entropy_diag(forecast_var).cpu()))
+        spread_values.append(float(torch.sqrt(forecast_var.mean().clamp_min(1e-8)).cpu()))
+
         current_state = forecast_state
         current_frame = step_outputs["pred_frame"].mean(dim=0, keepdim=True)
         if operator.has_observation(step_idx):
             observation = operator.observe(future[:, step_idx], add_noise=True).squeeze(0)
             forecast_observations = operator.project(step_outputs["pred_frame"])
-            analysis_state, _ = etkf_update(
+            analysis_state, diagnostics = etkf_update(
                 forecast_state=forecast_state,
                 forecast_observations=forecast_observations,
                 observation=observation,
@@ -151,9 +169,40 @@ def run_assimilated_rollout(
             )
             current_state = analysis_state
             current_frame = model.decode_latents(mean_state(analysis_state).previous_latent)
+            relative_entropy_values.append(
+                float(
+                    gaussian_relative_entropy_diag(
+                        mean_p=diagnostics["analysis_mean"],
+                        variance_p=diagnostics["analysis_var"],
+                        mean_q=diagnostics["forecast_mean"],
+                        variance_q=diagnostics["forecast_var"],
+                    ).cpu()
+                )
+            )
+            mutual_information_values.append(
+                float(
+                    gaussian_mutual_information_diag(
+                        prior_variance=diagnostics["forecast_var"],
+                        posterior_variance=diagnostics["analysis_var"],
+                    ).cpu()
+                )
+            )
+            innovation_values.append(float(diagnostics["innovation_norm"].cpu()))
+            observed_steps += 1
         pred_frames.append(current_frame)
         ensemble_state = current_state
-    return torch.stack(pred_frames, dim=1)
+
+    stacked_predictions = torch.stack(pred_frames, dim=1)
+    default_zero = [0.0]
+    return {
+        "pred_frames": stacked_predictions,
+        "entropy": float(np.mean(entropy_values or default_zero)),
+        "relative_entropy": float(np.mean(relative_entropy_values or default_zero)),
+        "mutual_information": float(np.mean(mutual_information_values or default_zero)),
+        "innovation_norm": float(np.mean(innovation_values or default_zero)),
+        "spread": float(np.mean(spread_values or default_zero)),
+        "observed_steps": float(observed_steps),
+    }
 
 
 def aggregate(items: list[dict[str, float]]) -> dict[str, float]:
@@ -195,7 +244,7 @@ def evaluate_checkpoint(
             context_sample = context[sample_idx : sample_idx + 1]
             future_sample = future[sample_idx : sample_idx + 1]
             open_pred = run_openloop_rollout(model, context_sample, pred_frames=pred_frames)
-            da_pred = run_assimilated_rollout(
+            da_result = run_assimilated_rollout(
                 model=model,
                 context=context_sample,
                 future=future_sample,
@@ -213,8 +262,14 @@ def evaluate_checkpoint(
             )
             da_metrics.append(
                 {
-                    "rmse": float(rmse(da_pred, future_sample).cpu()),
-                    "pcc": float(pattern_correlation(da_pred, future_sample).cpu()),
+                    "rmse": float(rmse(da_result["pred_frames"], future_sample).cpu()),
+                    "pcc": float(pattern_correlation(da_result["pred_frames"], future_sample).cpu()),
+                    "entropy": float(da_result["entropy"]),
+                    "relative_entropy": float(da_result["relative_entropy"]),
+                    "mutual_information": float(da_result["mutual_information"]),
+                    "innovation_norm": float(da_result["innovation_norm"]),
+                    "spread": float(da_result["spread"]),
+                    "observed_steps": float(da_result["observed_steps"]),
                 }
             )
 
@@ -227,10 +282,16 @@ def evaluate_checkpoint(
         "openloop_pcc": open_summary["pcc"],
         "da_rmse": da_summary["rmse"],
         "da_pcc": da_summary["pcc"],
+        "da_entropy": da_summary["entropy"],
+        "da_relative_entropy": da_summary["relative_entropy"],
+        "da_mutual_information": da_summary["mutual_information"],
+        "da_innovation_norm": da_summary["innovation_norm"],
+        "da_spread": da_summary["spread"],
+        "da_observed_steps": da_summary["observed_steps"],
     }
 
 
-def plot_curves(records: list[dict[str, float]], output_path: Path) -> None:
+def plot_quality_curves(records: list[dict[str, float]], output_path: Path) -> None:
     epochs = [record["epoch"] for record in records]
     open_rmse = [record["openloop_rmse"] for record in records]
     da_rmse = [record["da_rmse"] for record in records]
@@ -256,6 +317,40 @@ def plot_curves(records: list[dict[str, float]], output_path: Path) -> None:
     axes[1].legend(frameon=False, fontsize=9)
 
     figure.suptitle("True Open-Loop vs Latent ETKF Evolution Across Host Checkpoints", fontsize=15, y=1.02)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def plot_information_curves(records: list[dict[str, float]], output_path: Path) -> None:
+    epochs = [record["epoch"] for record in records]
+    entropy = [record["da_entropy"] for record in records]
+    relative_entropy = [record["da_relative_entropy"] for record in records]
+    mutual_information = [record["da_mutual_information"] for record in records]
+
+    figure, axes = plt.subplots(1, 3, figsize=(18, 5.2), constrained_layout=True)
+
+    axes[0].plot(epochs, entropy, color="#365c8d", linewidth=2.5, marker="o")
+    axes[0].set_title("Forecast Entropy vs Epoch")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Entropy")
+    axes[0].grid(alpha=0.25)
+
+    axes[1].plot(epochs, relative_entropy, color="#b24a3f", linewidth=2.5, marker="s")
+    axes[1].set_title("Relative Entropy vs Epoch")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Relative Entropy")
+    axes[1].grid(alpha=0.25)
+    if all(value > 0 for value in relative_entropy):
+        axes[1].set_yscale("log")
+
+    axes[2].plot(epochs, mutual_information, color="#2e8b57", linewidth=2.5, marker="^")
+    axes[2].set_title("Mutual Information vs Epoch")
+    axes[2].set_xlabel("Epoch")
+    axes[2].set_ylabel("Mutual Information")
+    axes[2].grid(alpha=0.25)
+
+    figure.suptitle("Latent ETKF Information Metrics Across Host Checkpoints", fontsize=15, y=1.02)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(figure)
@@ -290,15 +385,18 @@ def main() -> None:
         print(
             f"Epoch {record['epoch']:03d} | "
             f"open_rmse={record['openloop_rmse']:.4f} da_rmse={record['da_rmse']:.4f} "
-            f"open_pcc={record['openloop_pcc']:.4f} da_pcc={record['da_pcc']:.4f}"
+            f"open_pcc={record['openloop_pcc']:.4f} da_pcc={record['da_pcc']:.4f} "
+            f"entropy={record['da_entropy']:.4f} mi={record['da_mutual_information']:.4f}"
         )
 
     records.sort(key=lambda item: item["epoch"])
     metrics_path = output_dir / "da_epoch_curve_metrics.json"
     metrics_path.write_text(json.dumps({"config": vars(args), "records": records}, indent=2), encoding="utf-8")
-    plot_curves(records, output_dir / "da_epoch_curve.png")
+    plot_quality_curves(records, output_dir / "da_epoch_curve.png")
+    plot_information_curves(records, output_dir / "da_information_curve.png")
     print(f"Saved metrics to {metrics_path}")
     print(f"Saved plot to {output_dir / 'da_epoch_curve.png'}")
+    print(f"Saved plot to {output_dir / 'da_information_curve.png'}")
 
 
 if __name__ == "__main__":

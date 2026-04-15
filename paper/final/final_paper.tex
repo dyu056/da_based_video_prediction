@@ -11,10 +11,12 @@
 \usepackage{amsmath,amssymb}
 \usepackage{microtype}
 \usepackage{xcolor}
-\usepackage{graphicx}
 \usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{caption}
+\setlength{\emergencystretch}{2em}
 
-\title{Data Assimilation for Efficient Sparse-Conditioned Video Prediction in Latent Space}
+\title{Latent-Space Data Assimilation for Sparse-Conditioned Video Prediction}
 \author{Anonymous Author(s)}
 
 \begin{document}
@@ -22,59 +24,312 @@
 \maketitle
 
 \begin{abstract}
-We study whether data assimilation (DA) can improve the quality-compute tradeoff of sparse-conditioned sequential video prediction. Our framework separates a recognized video-prediction reference baseline from a lightweight latent sequential model that serves as the DA host, then uses ensemble Kalman style latent updates to correct forecasts under sparse observations. The final paper will report Moving MNIST results for the reference baseline, the open-loop DA host, always-assimilate correction, and selective-assimilation correction, with evaluation based on both prediction quality and uncertainty-aware compute metrics.
+This report studies whether data assimilation (DA) can improve sparse-conditioned video prediction when observations are available only intermittently. The motivating view is that long-horizon open-loop video prediction is an inherently unstable extrapolation problem: model error accumulates over time unless the forecast is repeatedly re-anchored to reality. We formulate video rollout as a latent-space forecast--analysis problem, train a lightweight sequential predictor as the DA host model, and apply a latent ensemble transform Kalman filter (ETKF) at test time under simulated sparse observations derived from held-out ground truth. On Moving MNIST, the same host model improves from RMSE $0.1856$ and PCC $0.6494$ in open-loop rollout to RMSE $0.1728$ and PCC $0.6581$ with latent ETKF under noisy full-frame observations every two future steps. A checkpoint sweep shows that this improvement is consistent across training and reaches RMSE $0.1599$ and PCC $0.6817$ at epoch $28$. The report also measures entropy, relative entropy, and mutual information to characterize the uncertainty reduction produced by the assimilation step. The current always-assimilate ETKF improves accuracy but increases runtime by a factor of $2.31\times$, so the main conclusion is that latent DA is effective as a quality-improving re-anchoring mechanism, while compute-aware selective assimilation remains future work.
 \end{abstract}
 
 \section{Introduction}
 
-Modern sequential video models must balance quality, temporal consistency, and computational cost. This paper treats sparse-conditioned video prediction as a latent filtering problem and positions DA as the mechanism that adaptively corrects sequential forecasts when uncertainty is high.
+Video prediction is a natural sequential inference problem: a model observes a prefix of frames and must extrapolate plausible future states. In practice, purely open-loop predictors often drift over time, while more expressive generative models can be computationally expensive. This suggests a broader principle: long-horizon extrapolation is intrinsically fragile because local model errors compound into global instability. Data assimilation (DA) offers a different viewpoint. Instead of treating the predictor as a one-shot generator, DA decomposes the problem into a forecast step and an analysis step: first forecast the next state, then correct that forecast whenever new evidence becomes available.
+
+This report explores that idea on a controlled benchmark. We do not study unconditional text-to-video generation, where no post-prefix observations are available and DA has no natural signal to assimilate. Instead, we study \emph{sparse-conditioned video prediction}: after observing the first $10$ frames of a Moving MNIST sequence, the model predicts the next $10$ frames and occasionally receives sparse noisy observations derived from the held-out future frames. In this sense, DA does not eliminate extrapolation; it breaks a difficult long-range extrapolation problem into a sequence of shorter forecast intervals that are repeatedly pulled back toward observed reality. This is a synthetic-observation setting, analogous to standard DA practice where partial measurements are simulated from known truth in order to validate an assimilation pipeline under controlled conditions.
+
+The project goal is modest but important: determine whether a latent-space ETKF can improve prediction quality over the same trained host predictor, and measure that improvement with both frame metrics and DA uncertainty metrics. Because the course requires a complete DA workflow, the report emphasizes problem formulation, algorithm design, numerical experiments, and interpretation rather than only final accuracy.
 
 \section{Related Work}
 
-The final manuscript will connect three threads: latent and reduced-order DA, efficient sequential video prediction, and Bayesian warm-start ideas for modern generative models.
+DA and machine learning share a common Bayesian structure. \citet{buizza2022data} emphasize that latent and reduced-order spaces are especially attractive when the original state is high-dimensional, which makes latent-space video prediction a natural candidate for DA. Recent generative DA work also shows that learned priors can support state estimation under sparse observations \citep{manshausen2024generative, zheng2024ensemble}. At the same time, \citet{hodyss2025using} caution that exact posterior matching in diffusion-based DA may become computationally awkward, which motivates our choice to apply DA around a lightweight predictor rather than to build a fully diffusion-native assimilation pipeline.
+
+On the video side, modern predictive baselines such as MCVD, Latent-Shift, and SimVP show that latent structure and efficient temporal modeling are critical design ingredients \citep{voleti2022mcvd, an2023latentshift, gao2022simvp}. In this report, SimVP serves as a literature-aware reference baseline, while a compact recurrent latent predictor is used as the DA host because it exposes a stepwise forecast state that can be corrected by ETKF.
 
 \section{Problem Formulation}
 
-Let $x_t$ denote the frame at time $t$, $z_t$ its latent representation, $z_t^f$ the forecast state, and $z_t^a$ the analysis state. The core forecast-analysis loop is
+Let $x_t \in \mathbb{R}^{H \times W}$ denote the video frame at time $t$, and let $z_t$ denote a latent representation of that frame. We use an encoder--decoder pair
 \begin{align}
     z_t &= E(x_t), \\
-    z_t^{f} &= M_{\theta}(z_{t-1}^{a}) + \eta_t, \\
-    y_t &= H(x_t) + \epsilon_t, \\
-    z_t^{a} &= z_t^{f} + K_t \left(y_t - H(D(z_t^{f}))\right).
+    x_t &= D(z_t).
 \end{align}
+
+The latent forecast model is written as
+\begin{equation}
+    z_{t+1}^{f} = M_{\theta}(z_{t}^{a}) + \eta_{t+1},
+\end{equation}
+where $z_{t+1}^{f}$ is the forecast latent state, $z_t^{a}$ is the previous analysis state, $M_{\theta}$ is the learned predictor, and $\eta_{t+1}$ represents forecast uncertainty.
+
+Observations arrive through
+\begin{equation}
+    y_{t+1} = H(x_{t+1}) + \epsilon_{t+1},
+\end{equation}
+where $H$ is the observation operator and $\epsilon_{t+1}$ is observation noise. In this project, $H$ is synthetic but controlled: it may reveal a full frame, a masked subset of pixels, or a low-resolution version of the true future frame.
+
+The analysis step combines the forecast with the observation:
+\begin{equation}
+    z_{t+1}^{a} = z_{t+1}^{f} + K_{t+1}\left(y_{t+1} - H(D(z_{t+1}^{f}))\right),
+\end{equation}
+where the Kalman gain is estimated from the latent ensemble. This gives the core DA loop used in the project:
+\begin{enumerate}[leftmargin=1.2em]
+    \item forecast the next latent state cheaply,
+    \item project the forecast into observation space,
+    \item compare it with the available measurement,
+    \item update the latent state by ETKF,
+    \item continue the rollout from the corrected state.
+\end{enumerate}
 
 \section{Method}
 
-The final method section will describe three components:
+\subsection{Predictors}
+
+Two predictor roles are used in the experiments.
+
+\paragraph{SimVP reference baseline.}
+We train a compact SimVP-style predictor as a literature-aware reference baseline. It takes the first $10$ frames as input and predicts the next $10$ frames directly. This baseline is useful as an external reference, but it is not used inside the DA loop.
+
+\paragraph{Open-loop DA host model.}
+The DA host is a lightweight \texttt{OpenLoopVideoPredictor}. It contains:
 \begin{enumerate}[leftmargin=1.2em]
-    \item a literature-aware reference baseline (`SimVP`);
-    \item a lightweight latent sequential host model for DA;
-    \item a selective-assimilation policy driven by innovation, spread, or entropy.
+    \item a convolutional encoder that maps frames to latent feature maps,
+    \item a ConvLSTM recurrent state that carries temporal information,
+    \item a residual latent update head,
+    \item a convolutional decoder that maps predicted latent states back to frames.
 \end{enumerate}
+
+Given the first $10$ frames, the host encodes them, updates the ConvLSTM hidden state, and stores the last latent feature map as the initial forecast state. Each future step is then predicted by rolling the latent state forward in open loop. This stepwise state representation is why the DA host is suitable for ETKF.
+
+\subsection{Open-Loop Training Formulation}
+
+The open-loop host is trained as a deterministic future predictor before any assimilation is applied. Let the observed context frames be $x_{1:T_c}$ and the target future frames be $x_{T_c+1:T_c+T_p}$, with $T_c=T_p=10$ in the completed experiments. Each context frame is encoded into a latent feature map,
+\begin{equation}
+    z_t = E(x_t), \qquad t = 1, \dots, T_c.
+\end{equation}
+The encoded context sequence is then processed by the ConvLSTM to produce the initial recurrent state $(h_{T_c}, c_{T_c})$ and the last context latent $z_{T_c}$.
+
+During forecasting, the predictor rolls forward autoregressively in latent space:
+\begin{align}
+    h_{t+1}, c_{t+1} &= \mathrm{ConvLSTM}(z_t, h_t, c_t), \\
+    \hat{z}_{t+1} &= z_t + G(h_{t+1}), \\
+    \hat{x}_{t+1} &= D(\hat{z}_{t+1}),
+\end{align}
+where $G$ is the residual latent prediction head. The residual form is important: instead of predicting the next latent from scratch, the model predicts a correction to the previous latent state. In open-loop rollout, the predicted latent $\hat{z}_{t+1}$ is fed back as the next input latent. This is exactly the source of drift that later motivates ETKF correction.
+
+The main training objective is a foreground-weighted future-frame prediction loss,
+\begin{equation}
+    \mathcal{L}_{\mathrm{pred}}
+    =
+    \frac{1}{T_p N}
+    \sum_{t=1}^{T_p}\sum_{i=1}^{N}
+    w_{t,i}\big(\hat{x}_{T_c+t,i} - x_{T_c+t,i}\big)^2,
+\end{equation}
+where $N$ is the number of pixels in one frame and the pixel weights are
+\begin{equation}
+    w_{t,i} = 1 + \lambda_{\mathrm{fg}} x_{T_c+t,i}.
+\end{equation}
+This weighting emphasizes digit pixels over the mostly black background and discourages the trivial low-energy solution where the predictor outputs nearly blank frames.
+
+To stabilize the latent representation, training also includes three auxiliary losses:
+\begin{align}
+    \mathcal{L}_{\mathrm{recon}} &= \mathrm{MSE}\big(D(E(x_{1:T_c})), x_{1:T_c}\big), \\
+    \mathcal{L}_{\mathrm{latent}} &= \mathrm{MSE}\big(\hat{z}_{T_c+1:T_c+T_p}, E(x_{T_c+1:T_c+T_p})\big), \\
+    \mathcal{L}_{\mathrm{future\_recon}} &= \mathrm{MSE}\big(D(E(x_{T_c+1:T_c+T_p})), x_{T_c+1:T_c+T_p}\big).
+\end{align}
+The first term regularizes the context autoencoding path, the second directly supervises the predicted latent rollout, and the third keeps the decoder aligned with future-frame latents.
+
+The total host-training objective is
+\begin{equation}
+    \mathcal{L}
+    =
+    \mathcal{L}_{\mathrm{pred}}
+    + \lambda_{\mathrm{recon}}\mathcal{L}_{\mathrm{recon}}
+    + \lambda_{\mathrm{future\_recon}}\mathcal{L}_{\mathrm{future\_recon}}
+    + \lambda_{\mathrm{latent}}\mathcal{L}_{\mathrm{latent}}.
+\end{equation}
+In the completed runs, the default weights were $\lambda_{\mathrm{recon}}=0.1$, $\lambda_{\mathrm{future\_recon}}=0.1$, $\lambda_{\mathrm{latent}}=0.5$, and $\lambda_{\mathrm{fg}}=6.0$.
+
+\subsection{Observation Model}
+
+The observation operator is implemented as a \texttt{SparseObservationOperator}. It supports:
+\begin{enumerate}[leftmargin=1.2em]
+    \item \texttt{full}: the entire frame is observed,
+    \item \texttt{masked}: only a fixed subset of pixels is observed,
+    \item \texttt{lowres}: a downsampled frame is observed.
+\end{enumerate}
+
+The current completed L40 experiment uses the \texttt{full} operator with observations every two future steps and additive Gaussian observation noise with standard deviation $0.02$. Over a $10$-step future rollout, this produces $5$ assimilation events.
+
+\subsection{Latent ETKF Update}
+
+At each assimilation step, we sample a small ensemble of latent states around the current forecast state, propagate each member forward through the host model, decode those members into observation space, and apply an ETKF update in latent space. The updated latent ensemble mean is then decoded as the corrected frame and passed to the next forecast step.
+
+\subsection{Metrics}
+
+The report uses both predictive and DA-specific metrics.
+
+\paragraph{Prediction metrics.}
+For a predicted frame sequence $\hat{x}$ and target sequence $x$,
+\begin{equation}
+    \mathrm{RMSE} = \sqrt{\frac{1}{N}\sum_{i=1}^{N}(\hat{x}_i - x_i)^2},
+\end{equation}
+and the pattern correlation coefficient (PCC) is
+\begin{equation}
+    \mathrm{PCC} =
+    \frac{\sum_i (\hat{x}_i - \bar{\hat{x}})(x_i - \bar{x})}
+    {\sqrt{\sum_i(\hat{x}_i - \bar{\hat{x}})^2}\sqrt{\sum_i(x_i - \bar{x})^2}}.
+\end{equation}
+
+\paragraph{Uncertainty metrics.}
+Let the forecast and analysis latent distributions be approximated as diagonal Gaussians with means $(\mu_f, \mu_a)$ and variances $(\sigma_f^2, \sigma_a^2)$.
+Forecast entropy is
+\begin{equation}
+    H_f \approx \frac{1}{2d}\sum_{i=1}^{d}\log(2\pi e \sigma_{f,i}^2).
+\end{equation}
+Relative entropy is the diagonal Gaussian KL divergence
+\begin{equation}
+    D_{\mathrm{KL}}(p^a \| p^f)
+    \approx
+    \frac{1}{2d}\sum_{i=1}^{d}
+    \left[
+    \log\frac{\sigma_{f,i}^2}{\sigma_{a,i}^2}
+    +
+    \frac{\sigma_{a,i}^2 + (\mu_{a,i}-\mu_{f,i})^2}{\sigma_{f,i}^2}
+    - 1
+    \right].
+\end{equation}
+Mutual information is approximated by the entropy drop:
+\begin{equation}
+    I \approx \frac{1}{2d}\sum_{i=1}^{d}\log\frac{\sigma_{f,i}^2}{\sigma_{a,i}^2}.
+\end{equation}
+These three metrics help interpret whether the forecast is uncertain, how strongly the analysis changes the forecast, and how much uncertainty the observation removes.
 
 \section{Experimental Setup}
 
-The primary benchmark is Moving MNIST with a $10 \rightarrow 10$ prediction setup. The main comparison will include:
-\begin{enumerate}[leftmargin=1.2em]
-    \item `SimVP` reference baseline;
-    \item open-loop DA host model;
-    \item always-assimilate DA host model;
-    \item selective-assimilation DA host model.
-\end{enumerate}
+\subsection{Dataset and Task}
 
-The final paper will report RMSE, PCC, entropy, relative entropy, mutual information, runtime, and refinement frequency.
+All completed experiments use Moving MNIST. Each sequence contains $20$ grayscale frames at resolution $64 \times 64$ with two moving digits. The prediction task is:
+\begin{itemize}[leftmargin=1.2em]
+    \item context: first $10$ frames,
+    \item target: next $10$ frames.
+\end{itemize}
+
+\subsection{Training Setup}
+
+The SimVP reference baseline was trained for $50$ epochs on $4000$ training sequences with $800$ validation sequences. The DA host model was trained for $30$ epochs on the same train/validation split. The host uses latent dimension $64$, hidden dimension $128$, batch size $32$, and the open-loop objective described above.
+
+\subsection{DA Evaluation Setup}
+
+The completed DA evaluation uses:
+\begin{itemize}[leftmargin=1.2em]
+    \item ensemble size $8$,
+    \item latent noise $0.03$,
+    \item hidden and cell noise $0.01$,
+    \item noisy full-frame observations every two future steps,
+    \item $128$ validation sequences for the main open-loop versus ETKF comparison,
+    \item $64$ validation sequences for the checkpoint sweep.
+\end{itemize}
+
+The observations are generated from held-out ground-truth future frames. This is not used during training. It is a synthetic-observation benchmark designed to validate the DA mechanism under controlled conditions.
 
 \section{Results}
 
-This section will be filled with the completed baseline replication and DA experiments. At the current project stage, the recognized `SimVP` baseline has already been replicated on the lab L40 server and will serve as the reference point for the DA comparisons.
+\subsection{Reference Baseline and Host Training}
+
+Table~\ref{tab:main-results} summarizes the main completed metrics. The SimVP reference baseline reaches RMSE $0.1942$ and PCC $0.5964$ on its final validation checkpoint. The DA host model, even before assimilation, is competitive in this project setup and reaches validation RMSE $0.1860$ and PCC $0.6526$ at epoch $30$.
+
+\begin{table}[t]
+    \centering
+    \caption{Main completed results on Moving MNIST. Entropy, relative entropy, and mutual information apply to the DA run because they are defined from the forecast--analysis distributions.}
+    \label{tab:main-results}
+    \begin{tabular}{lcccccc}
+        \toprule
+        Method & RMSE & PCC & Entropy & Rel. Ent. & MI & Runtime \\
+        \midrule
+        SimVP reference baseline & 0.1942 & 0.5964 & -- & -- & -- & -- \\
+        Open-loop DA host (eval) & 0.1856 & 0.6494 & -- & -- & -- & $1.00\times$ \\
+        DA host + latent ETKF & 0.1728 & 0.6581 & -5.8485 & 352.4325 & 0.5677 & $2.31\times$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Figure~\ref{fig:host-training} shows the training history of the open-loop host. Validation loss decreases steadily across training, while PCC improves throughout the later epochs even when the loss curve is already flattening. This behavior motivated the checkpoint sweep reported below.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{../../outputs/server_da_result/host_training_curves.png}
+    \caption{Training curves for the open-loop DA host model on the L40 server. The figure shows train/validation loss, RMSE, and PCC over $30$ epochs.}
+    \label{fig:host-training}
+\end{figure}
+
+\subsection{Open-Loop versus Latent ETKF}
+
+The main completed DA result is a like-for-like comparison on the same trained host checkpoint. Open-loop rollout gives RMSE $0.1856$ and PCC $0.6494$, while latent ETKF reduces RMSE to $0.1728$ and raises PCC to $0.6581$. This is a clear quality improvement under sparse observations. The tradeoff is compute: always-assimilate ETKF costs $2.31\times$ the open-loop runtime.
+
+Figure~\ref{fig:openloop-vs-da} visualizes this final comparison. The key result is not that ETKF is cheaper; it is that ETKF provides a meaningful correction signal that improves the same host predictor under controlled sparse observations.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.92\linewidth]{../../outputs/server_da_result/openloop_vs_da_comparison.png}
+    \caption{Final evaluation on the same host checkpoint. Latent ETKF improves both RMSE and PCC relative to open-loop rollout, but with higher runtime.}
+    \label{fig:openloop-vs-da}
+\end{figure}
+
+\subsection{Evolution Across Training Epochs}
+
+To test whether the DA gain is a one-off artifact of the final checkpoint, we evaluated open-loop and latent ETKF on every saved host checkpoint. Figure~\ref{fig:epoch-curves} shows that ETKF improves RMSE throughout the sweep and generally improves PCC after the early training stage.
+
+The strongest checkpoint in the completed sweep is epoch $28$:
+\begin{itemize}[leftmargin=1.2em]
+    \item open-loop: RMSE $0.1692$, PCC $0.6685$,
+    \item latent ETKF: RMSE $0.1599$, PCC $0.6817$.
+\end{itemize}
+
+At the final epoch $30$, the same trend remains:
+\begin{itemize}[leftmargin=1.2em]
+    \item open-loop: RMSE $0.1733$, PCC $0.6626$,
+    \item latent ETKF: RMSE $0.1632$, PCC $0.6788$.
+\end{itemize}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{../../outputs/server_da_result/da_epoch_curve.png}
+    \caption{Checkpoint sweep over the open-loop host. The latent ETKF correction improves RMSE across the sweep and improves PCC once the host reaches a reasonable forecast quality.}
+    \label{fig:epoch-curves}
+\end{figure}
+
+\subsection{Interpretation of the DA Metrics}
+
+The DA run also reports entropy, relative entropy, and mutual information. These quantities are useful because RMSE and PCC only say whether the final prediction is good; they do not say \emph{why} assimilation helped or whether the update is statistically reasonable.
+
+\paragraph{Entropy.}
+Forecast entropy measures how uncertain the latent forecast distribution is before the new observation is used. In this project it is computed from the forecast ensemble variance under a diagonal Gaussian approximation. The negative entropy value in Table~\ref{tab:main-results} is not an error: it is a \emph{differential entropy} of a continuous distribution, and differential entropies can be negative when the latent variance is small. The practical interpretation is that the latent forecast is already fairly concentrated rather than wildly spread out.
+
+\paragraph{Relative entropy.}
+Relative entropy is the Kullback--Leibler divergence from the analysis distribution to the forecast distribution. It measures how strongly the assimilation step changes the model belief after an observation arrives. In this experiment, the relative entropy is large, which indicates that the observation is not merely making a cosmetic correction. Instead, the analysis step is moving the latent state in a substantial way, consistent with the fact that open-loop extrapolation accumulates drift and requires periodic re-anchoring.
+
+\paragraph{Mutual information.}
+Mutual information measures how much uncertainty is removed by the observation. In the diagonal Gaussian approximation used here, it is the entropy drop from the forecast covariance to the analysis covariance. The positive value reported in Table~\ref{tab:main-results} indicates that the observation does more than shift the posterior mean: it actually reduces posterior uncertainty. This supports the interpretation that the assimilated observation is informative rather than redundant.
+
+Taken together, these three metrics tell a coherent story. The forecast has nonzero uncertainty, the assimilation step changes the forecast in a meaningful way, and the observation reduces uncertainty. That is the statistical signature we would hope to see if DA is functioning as intended. In other words, the ETKF update is not only lowering RMSE and improving PCC, but also acting like a genuine forecast--analysis correction step rather than a heuristic post-processing trick.
 
 \section{Discussion}
 
-The final discussion will analyze whether DA improves the quality-compute tradeoff, whether selective correction is competitive with always-assimilate correction, and where latent-space DA breaks down under sparse observations.
+The project delivers a complete DA workflow:
+\begin{enumerate}[leftmargin=1.2em]
+    \item define a sequential latent state-space model,
+    \item train a forecast model,
+    \item define an observation operator and noise model,
+    \item perform ETKF analysis updates,
+    \item evaluate with RMSE, PCC, entropy, relative entropy, and mutual information,
+    \item interpret the results against both a reference baseline and an open-loop control.
+\end{enumerate}
+
+The main positive finding is that latent ETKF improves prediction quality over the same host predictor. This is a meaningful result because it validates the DA formulation on a nontrivial video task and supports the underlying philosophy of the project: reality injections can stabilize an otherwise drifting extrapolation. The main negative finding is equally important: always-assimilate ETKF is not yet a speedup. The current result improves quality but increases runtime, so the original motivation of accelerating video generation is only partially realized. The appropriate interpretation is therefore that DA currently acts as an \emph{accuracy-improving re-anchoring mechanism}, while compute-aware selective assimilation remains future work.
+
+The other central modeling decision is the observation source. In this report, observations are simulated from held-out ground truth. For a course project, this is an appropriate and standard DA benchmark design because it isolates the assimilation mechanism under controlled sparsity and noise. It would become problematic only if the future truth were revealed too densely or too directly. In our setting, the observations are sparse, noisy, and applied only at test time. The resulting experiment should therefore be read as a controlled study of how partial contact with the true future stabilizes rollout, not as a claim that future truth is freely available in deployment.
+
+There are several limitations. First, the observation study is still narrow; only the full-frame periodic observation regime has been completed end to end. Second, the information-metric analysis is stronger at the final checkpoint than across all checkpoints. Third, the reference SimVP baseline in this project is a practical in-repo implementation rather than an exact benchmark-faithful reproduction of the strongest published settings. These limitations are acceptable for the course report, but they also define the most natural next experiments.
 
 \section{Conclusion}
 
-This paper aims to show that DA can be used as adaptive latent filtering for efficient sparse-conditioned video prediction, with a focus on a clean experimental design that is both class-project-safe and paper-ready.
+This report studies latent-space DA for sparse-conditioned video prediction on Moving MNIST. A lightweight open-loop latent predictor was trained as the DA host, and a latent ETKF was applied at test time under synthetic sparse observations. The completed experiments show that ETKF improves both RMSE and PCC relative to open-loop rollout on the same host checkpoint, and that this improvement is visible across a checkpoint sweep rather than only at a single epoch.
+
+The current evidence supports the claim that DA is a useful framework for \emph{correcting} sequential video forecasts under sparse observations. More broadly, it supports the view that stable prediction of a known world should not rely on long open-loop extrapolation alone; it should be formulated as repeated local forecasting plus re-anchoring to new evidence whenever such evidence is available. The results do not yet support the stronger claim that DA speeds up video generation, because the always-assimilate ETKF remains slower than open-loop rollout. The most direct next step is therefore selective assimilation: assimilate only when the innovation, spread, or entropy is large enough to justify the cost.
 
 \bibliographystyle{plainnat}
 \bibliography{project_references}
