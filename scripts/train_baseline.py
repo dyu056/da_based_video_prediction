@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-recon-weight", type=float, default=0.1)
     parser.add_argument("--latent-weight", type=float, default=0.5)
     parser.add_argument("--foreground-weight", type=float, default=6.0)
+    parser.add_argument("--save-every-epoch", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     return parser.parse_args()
@@ -285,6 +286,9 @@ def main() -> None:
     history = []
     best_val_loss = float("inf")
     best_checkpoint_path = output_dir / "best_model.pt"
+    epoch_checkpoint_dir = output_dir / "epoch_checkpoints"
+    if args.save_every_epoch:
+        epoch_checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print(
         f"Training model={args.model} on device={device} "
@@ -330,16 +334,18 @@ def main() -> None:
         epoch_summary = {"epoch": epoch, "train": train_summary, "val": val_summary}
         history.append(epoch_summary)
 
+        checkpoint_payload = {
+            "model_state_dict": model.state_dict(),
+            "args": vars(args),
+            "history": history,
+        }
+
         if val_summary["loss"] < best_val_loss:
             best_val_loss = val_summary["loss"]
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "args": vars(args),
-                    "history": history,
-                },
-                best_checkpoint_path,
-            )
+            torch.save(checkpoint_payload, best_checkpoint_path)
+
+        if args.save_every_epoch:
+            torch.save(checkpoint_payload, epoch_checkpoint_dir / f"epoch_{epoch:03d}.pt")
 
         print(
             f"Epoch {epoch:02d} | "
@@ -365,6 +371,8 @@ def main() -> None:
 
     print(f"Saved checkpoint to {best_checkpoint_path}")
     print(f"Saved metrics to {metrics_path}")
+    if args.save_every_epoch:
+        print(f"Saved per-epoch checkpoints to {epoch_checkpoint_dir}")
 
 
 if __name__ == "__main__":

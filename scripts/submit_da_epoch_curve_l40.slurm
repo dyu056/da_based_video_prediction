@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=da_video_baseline
+#SBATCH --job-name=da_epoch_curve
 #SBATCH --partition=compute
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=08:00:00
-#SBATCH --output=slurm_baseline_%j.out
-#SBATCH --error=slurm_baseline_%j.err
+#SBATCH --time=06:00:00
+#SBATCH --output=slurm_da_curve_%j.out
+#SBATCH --error=slurm_da_curve_%j.err
 
 set -euo pipefail
 
@@ -18,30 +18,22 @@ ENV_TYPE="${ENV_TYPE:-conda}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv-l40}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-MODEL="${MODEL:-simvp}"
-RUN_NAME="${RUN_NAME:-${MODEL}_baseline_${SLURM_JOB_ID}}"
-
-EPOCHS="${EPOCHS:-50}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
-TRAIN_SEQUENCES="${TRAIN_SEQUENCES:-4000}"
-VAL_SEQUENCES="${VAL_SEQUENCES:-800}"
-CONTEXT_FRAMES="${CONTEXT_FRAMES:-10}"
-PRED_FRAMES="${PRED_FRAMES:-10}"
-IMAGE_SIZE="${IMAGE_SIZE:-64}"
-NUM_DIGITS="${NUM_DIGITS:-2}"
-LR="${LR:-0.001}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-0}"
-
-echo "Slurm Job ID: ${SLURM_JOB_ID}"
-echo "Running on host: $(hostname)"
-echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
-echo "Project directory: ${PROJECT_DIR}"
-echo "Model: ${MODEL}"
-echo "Run name: ${RUN_NAME}"
-echo "Num workers: ${NUM_WORKERS}"
-echo "Save every epoch: ${SAVE_EVERY_EPOCH}"
-echo "Environment type: ${ENV_TYPE}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-outputs/da_host_openloop_curve_v1/epoch_checkpoints}"
+RUN_NAME="${RUN_NAME:-da_epoch_curve_${SLURM_JOB_ID}}"
+SPLIT="${SPLIT:-val}"
+EVAL_SEQUENCES="${EVAL_SEQUENCES:-64}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+OBSERVATION_KIND="${OBSERVATION_KIND:-full}"
+OBSERVE_EVERY="${OBSERVE_EVERY:-2}"
+MASK_FRACTION="${MASK_FRACTION:-0.25}"
+DOWNSAMPLE_SIZE="${DOWNSAMPLE_SIZE:-16}"
+OBSERVATION_NOISE="${OBSERVATION_NOISE:-0.02}"
+ENSEMBLE_SIZE="${ENSEMBLE_SIZE:-8}"
+LATENT_NOISE="${LATENT_NOISE:-0.03}"
+HIDDEN_NOISE="${HIDDEN_NOISE:-0.01}"
+CELL_NOISE="${CELL_NOISE:-0.01}"
+SEED="${SEED:-42}"
 
 activate_conda_env() {
   find_conda() {
@@ -49,7 +41,6 @@ activate_conda_env() {
       command -v conda
       return 0
     fi
-
     local candidate
     for candidate in \
       "$HOME/miniconda3/bin/conda" \
@@ -61,16 +52,13 @@ activate_conda_env() {
         return 0
       fi
     done
-
     return 1
   }
-
   CONDA_BIN="$(find_conda || true)"
   if [[ -z "${CONDA_BIN}" ]]; then
     echo "conda not found."
     exit 1
   fi
-
   CONDA_BASE="$("${CONDA_BIN}" info --base)"
   source "${CONDA_BASE}/etc/profile.d/conda.sh"
   conda activate "${ENV_NAME}"
@@ -81,7 +69,6 @@ activate_venv() {
     echo "Virtualenv activate script not found at ${VENV_DIR}/bin/activate"
     exit 1
   fi
-
   # shellcheck disable=SC1090
   source "${VENV_DIR}/bin/activate"
   PYTHON_BIN="python"
@@ -113,27 +100,30 @@ case "${ENV_TYPE}" in
     ;;
 esac
 
+if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
+  echo "Checkpoint directory not found: ${CHECKPOINT_DIR}"
+  exit 1
+fi
+
 nvidia-smi || true
 which "${PYTHON_BIN}"
 "${PYTHON_BIN}" -c "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available()); print('device_count', torch.cuda.device_count())"
 
-EXTRA_ARGS=()
-if [[ "${SAVE_EVERY_EPOCH}" == "1" ]]; then
-  EXTRA_ARGS+=(--save-every-epoch)
-fi
-
-srun "${PYTHON_BIN}" -u scripts/train_baseline.py \
-  --model "${MODEL}" \
-  --epochs "${EPOCHS}" \
-  --batch-size "${BATCH_SIZE}" \
-  --train-sequences "${TRAIN_SEQUENCES}" \
-  --val-sequences "${VAL_SEQUENCES}" \
-  --context-frames "${CONTEXT_FRAMES}" \
-  --pred-frames "${PRED_FRAMES}" \
-  --image-size "${IMAGE_SIZE}" \
-  --num-digits "${NUM_DIGITS}" \
-  --lr "${LR}" \
-  --num-workers "${NUM_WORKERS}" \
-  --device cuda \
+srun "${PYTHON_BIN}" -u scripts/evaluate_da_over_epochs.py \
+  --checkpoint-dir "${CHECKPOINT_DIR}" \
   --output-dir "outputs/${RUN_NAME}" \
-  "${EXTRA_ARGS[@]}"
+  --split "${SPLIT}" \
+  --eval-sequences "${EVAL_SEQUENCES}" \
+  --batch-size "${BATCH_SIZE}" \
+  --num-workers "${NUM_WORKERS}" \
+  --observation-kind "${OBSERVATION_KIND}" \
+  --observe-every "${OBSERVE_EVERY}" \
+  --mask-fraction "${MASK_FRACTION}" \
+  --downsample-size "${DOWNSAMPLE_SIZE}" \
+  --observation-noise "${OBSERVATION_NOISE}" \
+  --ensemble-size "${ENSEMBLE_SIZE}" \
+  --latent-noise "${LATENT_NOISE}" \
+  --hidden-noise "${HIDDEN_NOISE}" \
+  --cell-noise "${CELL_NOISE}" \
+  --seed "${SEED}" \
+  --device cuda
