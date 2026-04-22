@@ -29,9 +29,18 @@ CONTEXT_FRAMES="${CONTEXT_FRAMES:-10}"
 PRED_FRAMES="${PRED_FRAMES:-10}"
 IMAGE_SIZE="${IMAGE_SIZE:-64}"
 NUM_DIGITS="${NUM_DIGITS:-2}"
+LATENT_DIM="${LATENT_DIM:-64}"
+HIDDEN_DIM="${HIDDEN_DIM:-128}"
 LR="${LR:-0.001}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0001}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-0}"
+PRED_L1_WEIGHT="${PRED_L1_WEIGHT:-1.0}"
+PRED_BCE_WEIGHT="${PRED_BCE_WEIGHT:-0.4}"
+PRED_MSE_WEIGHT="${PRED_MSE_WEIGHT:-0.2}"
+TEACHER_FORCE_START="${TEACHER_FORCE_START:-0.6}"
+TEACHER_FORCE_END="${TEACHER_FORCE_END:-0.1}"
+GRAD_CLIP="${GRAD_CLIP:-1.0}"
 
 echo "Slurm Job ID: ${SLURM_JOB_ID}"
 echo "Running on host: $(hostname)"
@@ -39,6 +48,8 @@ echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
 echo "Project directory: ${PROJECT_DIR}"
 echo "Model: ${MODEL}"
 echo "Run name: ${RUN_NAME}"
+echo "Latent dim: ${LATENT_DIM}"
+echo "Hidden dim: ${HIDDEN_DIM}"
 echo "Num workers: ${NUM_WORKERS}"
 echo "Save every epoch: ${SAVE_EVERY_EPOCH}"
 echo "Environment type: ${ENV_TYPE}"
@@ -132,8 +143,17 @@ srun "${PYTHON_BIN}" -u scripts/train_baseline.py \
   --pred-frames "${PRED_FRAMES}" \
   --image-size "${IMAGE_SIZE}" \
   --num-digits "${NUM_DIGITS}" \
+  --latent-dim "${LATENT_DIM}" \
+  --hidden-dim "${HIDDEN_DIM}" \
   --lr "${LR}" \
+  --weight-decay "${WEIGHT_DECAY}" \
   --num-workers "${NUM_WORKERS}" \
+  --pred-l1-weight "${PRED_L1_WEIGHT}" \
+  --pred-bce-weight "${PRED_BCE_WEIGHT}" \
+  --pred-mse-weight "${PRED_MSE_WEIGHT}" \
+  --teacher-force-start "${TEACHER_FORCE_START}" \
+  --teacher-force-end "${TEACHER_FORCE_END}" \
+  --grad-clip "${GRAD_CLIP}" \
   --device cuda \
   --output-dir "outputs/${RUN_NAME}" \
   "${EXTRA_ARGS[@]}"

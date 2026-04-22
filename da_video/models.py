@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -13,14 +14,42 @@ class LatentForecastState:
     cell: torch.Tensor
 
 
+def _group_count(num_channels: int) -> int:
+    for candidate in (8, 4, 2, 1):
+        if num_channels % candidate == 0:
+            return candidate
+    return 1
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        groups = _group_count(channels)
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, channels),
+        )
+        self.activation = nn.SiLU(inplace=True)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.activation(inputs + self.block(inputs))
+
+
 class FrameEncoder(nn.Module):
     def __init__(self, latent_channels: int = 64) -> None:
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+            nn.GroupNorm(_group_count(32), 32),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(32),
             nn.Conv2d(32, latent_channels, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+            nn.GroupNorm(_group_count(latent_channels), latent_channels),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(latent_channels),
         )
 
     def forward(self, frames: torch.Tensor) -> torch.Tensor:
@@ -31,10 +60,15 @@ class FrameDecoder(nn.Module):
     def __init__(self, latent_channels: int = 64) -> None:
         super().__init__()
         self.decode = nn.Sequential(
+            ResidualConvBlock(latent_channels),
             nn.ConvTranspose2d(latent_channels, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 1, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid(),
+            nn.GroupNorm(_group_count(32), 32),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(32),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(_group_count(16), 16),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1),
         )
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
@@ -87,10 +121,20 @@ class OpenLoopVideoPredictor(nn.Module):
             kernel_size=3,
         )
         self.latent_head = nn.Sequential(
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            ResidualConvBlock(hidden_channels),
             nn.Conv2d(hidden_channels, latent_channels, kernel_size=3, padding=1),
         )
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+            nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.GroupNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
     def encode_frames(self, frames: torch.Tensor) -> torch.Tensor:
         leading_shape = frames.shape[:-3]
@@ -98,10 +142,16 @@ class OpenLoopVideoPredictor(nn.Module):
         latents = self.encoder(flat_frames)
         return latents.reshape(*leading_shape, *latents.shape[1:])
 
-    def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+    def decode_latents(
+        self,
+        latents: torch.Tensor,
+        apply_sigmoid: bool = True,
+    ) -> torch.Tensor:
         leading_shape = latents.shape[:-3]
         flat_latents = latents.reshape(-1, *latents.shape[-3:])
         frames = self.decoder(flat_latents)
+        if apply_sigmoid:
+            frames = torch.sigmoid(frames)
         return frames.reshape(*leading_shape, *frames.shape[1:])
 
     def initialize_state(
@@ -111,7 +161,8 @@ class OpenLoopVideoPredictor(nn.Module):
         batch_size, context_steps = context_frames.shape[:2]
         context_latents = self.encode_frames(context_frames)
         latent_channels, latent_height, latent_width = context_latents.shape[2:]
-        reconstructed_context = self.decode_latents(context_latents)
+        reconstructed_context_logits = self.decode_latents(context_latents, apply_sigmoid=False)
+        reconstructed_context = torch.sigmoid(reconstructed_context_logits)
 
         hidden = context_latents.new_zeros(batch_size, self.recurrent_cell.hidden_channels, latent_height, latent_width)
         cell = context_latents.new_zeros(batch_size, self.recurrent_cell.hidden_channels, latent_height, latent_width)
@@ -126,6 +177,7 @@ class OpenLoopVideoPredictor(nn.Module):
         )
         aux = {
             "recon_context": reconstructed_context,
+            "recon_context_logits": reconstructed_context_logits,
             "context_latents": context_latents,
         }
         return state, aux
@@ -136,7 +188,8 @@ class OpenLoopVideoPredictor(nn.Module):
     ) -> tuple[LatentForecastState, dict[str, torch.Tensor]]:
         hidden, cell = self.recurrent_cell(state.previous_latent, (state.hidden, state.cell))
         predicted_latent = state.previous_latent + self.latent_head(hidden)
-        predicted_frame = self.decode_latents(predicted_latent)
+        predicted_frame_logits = self.decode_latents(predicted_latent, apply_sigmoid=False)
+        predicted_frame = torch.sigmoid(predicted_frame_logits)
         next_state = LatentForecastState(
             previous_latent=predicted_latent,
             hidden=hidden,
@@ -144,22 +197,51 @@ class OpenLoopVideoPredictor(nn.Module):
         )
         return next_state, {
             "pred_latent": predicted_latent,
+            "pred_frame_logits": predicted_frame_logits,
             "pred_frame": predicted_frame,
         }
 
-    def forward(self, context_frames: torch.Tensor, pred_steps: int) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        context_frames: torch.Tensor,
+        pred_steps: int,
+        future_frames: torch.Tensor | None = None,
+        teacher_force_ratio: float = 0.0,
+    ) -> dict[str, torch.Tensor]:
         state, aux = self.initialize_state(context_frames)
+        teacher_force_latents = None
+        if future_frames is not None and teacher_force_ratio > 0.0:
+            teacher_force_latents = self.encode_frames(future_frames)
         pred_latents = []
         pred_frames = []
-        for _ in range(pred_steps):
+        pred_frame_logits = []
+        for step_idx in range(pred_steps):
             state, step_outputs = self.forecast_step(state)
             pred_latents.append(step_outputs["pred_latent"])
+            pred_frame_logits.append(step_outputs["pred_frame_logits"])
             pred_frames.append(step_outputs["pred_frame"])
+
+            if teacher_force_latents is not None and step_idx < pred_steps - 1:
+                teacher_mask = (
+                    torch.rand(state.previous_latent.shape[0], 1, 1, 1, device=state.previous_latent.device)
+                    < teacher_force_ratio
+                )
+                state = LatentForecastState(
+                    previous_latent=torch.where(
+                        teacher_mask,
+                        teacher_force_latents[:, step_idx],
+                        state.previous_latent,
+                    ),
+                    hidden=state.hidden,
+                    cell=state.cell,
+                )
 
         return {
             "pred_frames": torch.stack(pred_frames, dim=1),
+            "pred_frame_logits": torch.stack(pred_frame_logits, dim=1),
             "pred_latents": torch.stack(pred_latents, dim=1),
             "recon_context": aux["recon_context"],
+            "recon_context_logits": aux["recon_context_logits"],
             "context_latents": aux["context_latents"],
         }
 

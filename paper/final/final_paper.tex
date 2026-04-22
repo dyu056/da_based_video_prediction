@@ -33,7 +33,7 @@ Video prediction is a natural sequential inference problem: a model observes a p
 
 This report explores that idea on a controlled benchmark. We do not study unconditional text-to-video generation, where no post-prefix observations are available and DA has no natural signal to assimilate. Instead, we study \emph{sparse-conditioned video prediction}: after observing the first $10$ frames of a Moving MNIST sequence, the model predicts the next $10$ frames and occasionally receives sparse noisy observations derived from the held-out future frames. In this sense, DA does not eliminate extrapolation; it breaks a difficult long-range extrapolation problem into a sequence of shorter forecast intervals that are repeatedly pulled back toward observed reality. This is a synthetic-observation setting, analogous to standard DA practice where partial measurements are simulated from known truth in order to validate an assimilation pipeline under controlled conditions.
 
-The project goal is modest but important: determine whether a latent-space ETKF can improve prediction quality over the same trained host predictor, and measure that improvement with both frame metrics and DA uncertainty metrics. Because the course requires a complete DA workflow, the report emphasizes problem formulation, algorithm design, numerical experiments, and interpretation rather than only final accuracy.
+The project goal is modest but important: determine whether a latent-space ETKF can improve prediction quality over the same trained host predictor, and measure that improvement with both frame metrics and DA uncertainty metrics. Because the course requires a complete DA workflow, the report emphasizes problem formulation, algorithm design, numerical experiments, and interpretation rather than only final accuracy. During the latest project stage, the host predictor itself was substantially strengthened, so the report now includes the repaired open-loop baseline and its longer training curve alongside the completed ETKF results from the earlier host.
 
 \section{Related Work}
 
@@ -210,7 +210,7 @@ All completed experiments use Moving MNIST. Each sequence contains $20$ grayscal
 
 \subsection{Training Setup}
 
-The SimVP reference baseline was trained for $50$ epochs on $4000$ training sequences with $800$ validation sequences. The DA host model was trained for $30$ epochs on the same train/validation split. The host uses latent dimension $64$, hidden dimension $128$, batch size $32$, and the open-loop objective described above.
+The SimVP reference baseline was trained for $50$ epochs on $4000$ training sequences with $800$ validation sequences. The latest repaired DA host model was trained for $300$ epochs on $6000$ training sequences with $1200$ validation sequences. This host uses latent dimension $96$, hidden dimension $192$, batch size $32$, AdamW, scheduled latent teacher forcing, and the stronger open-loop objective described above.
 
 \subsection{DA Evaluation Setup}
 
@@ -230,7 +230,7 @@ The observations are generated from held-out ground-truth future frames. This is
 
 \subsection{Reference Baseline and Host Training}
 
-Table~\ref{tab:main-results} summarizes the main completed metrics. The SimVP reference baseline reaches RMSE $0.1942$ and PCC $0.5964$ on its final validation checkpoint. The DA host model, even before assimilation, is competitive in this project setup and reaches validation RMSE $0.1860$ and PCC $0.6526$ at epoch $30$.
+Table~\ref{tab:main-results} summarizes the main completed metrics for the finished DA comparison. In parallel, the repaired long-run host substantially improved the open-loop baseline itself: the best checkpoint by the total validation loss occurs at epoch $49$ with validation loss $0.2517$, RMSE $0.1500$, and PCC $0.7653$, while the final epoch $300$ reaches RMSE $0.1430$ and PCC $0.7738$ even though the total loss is slightly worse than the selected checkpoint. This is exactly the behavior visible in Figure~\ref{fig:host-training}: the training objective prefers an earlier checkpoint, but the late-epoch frame metrics keep improving.
 
 \begin{table}[t]
     \centering
@@ -247,20 +247,27 @@ Table~\ref{tab:main-results} summarizes the main completed metrics. The SimVP re
     \end{tabular}
 \end{table}
 
-Figure~\ref{fig:host-training} shows the training history of the open-loop host. Validation loss decreases steadily across training, while PCC improves throughout the later epochs even when the loss curve is already flattening. This behavior motivated the checkpoint sweep reported below.
+Figure~\ref{fig:host-training} shows the latest $300$-epoch training history of the repaired open-loop host. Validation loss decreases sharply early on and then flattens, while RMSE and PCC continue to improve later in training. This confirms the practical issue observed during experimentation: the checkpoint selected by the total loss is not identical to the visually strongest late-epoch forecast checkpoint.
 
 \begin{figure}[t]
     \centering
-    \includegraphics[width=\linewidth]{../../outputs/server_da_result/host_training_curves.png}
-    \caption{Training curves for the open-loop DA host model on the L40 server. The figure shows train/validation loss, RMSE, and PCC over $30$ epochs.}
+    \includegraphics[width=\linewidth]{../../outputs/server_baseline_result/openloop_host_repair_v2_long_training_curves.png}
+    \caption{Latest repaired open-loop host training curves on the L40 server. The figure shows train/validation loss, RMSE, and PCC over the full $300$-epoch run. The total loss prefers an earlier checkpoint, while RMSE/PCC continue improving later in training.}
     \label{fig:host-training}
+\end{figure}
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{../../outputs/server_baseline_result/openloop_host_repair_v2_long_sample_predictions.png}
+    \caption{Qualitative prediction grid from the latest repaired open-loop host. The top row is the $10$ observed context frames, the middle row is the ground-truth future, and the bottom row is the predicted future. The repaired host preserves coarse motion and digit identity much better than the earlier collapsed baseline, but it still blurs the two-digit structure in later forecast steps.}
+    \label{fig:latest-openloop-qualitative}
 \end{figure}
 
 \subsection{Open-Loop versus Latent ETKF}
 
-The main completed DA result is a like-for-like comparison on the same trained host checkpoint. Open-loop rollout gives RMSE $0.1856$ and PCC $0.6494$, while latent ETKF reduces RMSE to $0.1728$ and raises PCC to $0.6581$. This is a clear quality improvement under sparse observations. The tradeoff is compute: always-assimilate ETKF costs $2.31\times$ the open-loop runtime.
+The main completed DA result is a like-for-like comparison on the earlier completed host checkpoint. Open-loop rollout gives RMSE $0.1856$ and PCC $0.6494$, while latent ETKF reduces RMSE to $0.1728$ and raises PCC to $0.6581$. This is a clear quality improvement under sparse observations. The tradeoff is compute: always-assimilate ETKF costs $2.31\times$ the open-loop runtime.
 
-Figure~\ref{fig:openloop-vs-da} visualizes this final comparison. The key result is not that ETKF is cheaper; it is that ETKF provides a meaningful correction signal that improves the same host predictor under controlled sparse observations.
+Figure~\ref{fig:openloop-vs-da} visualizes this final comparison. The key result is not that ETKF is cheaper; it is that ETKF provides a meaningful correction signal that improves the same host predictor under controlled sparse observations. A repaired-host ETKF rerun was prepared after the stronger open-loop host became available, but that specific rerun was not completed in time for this draft because the lab-server connection timed out during submission.
 
 \begin{figure}[t]
     \centering
@@ -269,28 +276,11 @@ Figure~\ref{fig:openloop-vs-da} visualizes this final comparison. The key result
     \label{fig:openloop-vs-da}
 \end{figure}
 
-\subsection{Evolution Across Training Epochs}
+\subsection{Latest Baseline Interpretation}
 
-To test whether the DA gain is a one-off artifact of the final checkpoint, we evaluated open-loop and latent ETKF on every saved host checkpoint. Figure~\ref{fig:epoch-curves} shows that ETKF improves RMSE throughout the sweep and generally improves PCC after the early training stage.
+The repaired host changes the baseline story in an important way. Relative to the earlier open-loop host, it clearly raises the quality ceiling before any assimilation is applied. The best-loss checkpoint from the long run is already much stronger than the earlier host used in the first ETKF comparison, and the qualitative sequence in Figure~\ref{fig:latest-openloop-qualitative} shows why: the model no longer collapses immediately, and it tracks the coarse digit motion through the rollout. At the same time, the sequence also shows the remaining weakness. The later predicted frames still blur and partially merge the two digits, which is precisely the kind of cumulative rollout drift that motivates assimilation.
 
-The strongest checkpoint in the completed sweep is epoch $28$:
-\begin{itemize}[leftmargin=1.2em]
-    \item open-loop: RMSE $0.1692$, PCC $0.6685$,
-    \item latent ETKF: RMSE $0.1599$, PCC $0.6817$.
-\end{itemize}
-
-At the final epoch $30$, the same trend remains:
-\begin{itemize}[leftmargin=1.2em]
-    \item open-loop: RMSE $0.1733$, PCC $0.6626$,
-    \item latent ETKF: RMSE $0.1632$, PCC $0.6788$.
-\end{itemize}
-
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=\linewidth]{../../outputs/server_da_result/da_epoch_curve.png}
-    \caption{Checkpoint sweep over the open-loop host. The latent ETKF correction improves RMSE across the sweep and improves PCC once the host reaches a reasonable forecast quality.}
-    \label{fig:epoch-curves}
-\end{figure}
+This stronger open-loop baseline therefore does not invalidate the DA framing. Instead, it sharpens the next experimental question: once the host itself is no longer obviously weak, how much additional benefit does latent ETKF still provide on the repaired checkpoint selected by the total validation loss? That repaired-host ETKF rerun is the immediate next experiment.
 
 \subsection{Interpretation of the DA Metrics}
 
@@ -323,7 +313,7 @@ The main positive finding is that latent ETKF improves prediction quality over t
 
 The other central modeling decision is the observation source. In this report, observations are simulated from held-out ground truth. For a course project, this is an appropriate and standard DA benchmark design because it isolates the assimilation mechanism under controlled sparsity and noise. It would become problematic only if the future truth were revealed too densely or too directly. In our setting, the observations are sparse, noisy, and applied only at test time. The resulting experiment should therefore be read as a controlled study of how partial contact with the true future stabilizes rollout, not as a claim that future truth is freely available in deployment.
 
-There are several limitations. First, the observation study is still narrow; only the full-frame periodic observation regime has been completed end to end. Second, the information-metric analysis is stronger at the final checkpoint than across all checkpoints. Third, the reference SimVP baseline in this project is a practical in-repo implementation rather than an exact benchmark-faithful reproduction of the strongest published settings. These limitations are acceptable for the course report, but they also define the most natural next experiments.
+There are several limitations. First, the observation study is still narrow; only the full-frame periodic observation regime has been completed end to end. Second, the strongest completed ETKF result still comes from the earlier host, while the repaired-host ETKF rerun was blocked by a temporary server timeout before completion. Third, the reference SimVP baseline in this project is a practical in-repo implementation rather than an exact benchmark-faithful reproduction of the strongest published settings. These limitations are acceptable for the course report, but they also define the most natural next experiments.
 
 \section{Conclusion}
 

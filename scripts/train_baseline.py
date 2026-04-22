@@ -44,11 +44,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--simvp-n-s", type=int, default=4)
     parser.add_argument("--simvp-n-t", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--recon-weight", type=float, default=0.1)
     parser.add_argument("--future-recon-weight", type=float, default=0.1)
     parser.add_argument("--latent-weight", type=float, default=0.5)
     parser.add_argument("--foreground-weight", type=float, default=6.0)
+    parser.add_argument("--pred-l1-weight", type=float, default=1.0)
+    parser.add_argument("--pred-bce-weight", type=float, default=0.4)
+    parser.add_argument("--pred-mse-weight", type=float, default=0.2)
+    parser.add_argument("--teacher-force-start", type=float, default=0.6)
+    parser.add_argument("--teacher-force-end", type=float, default=0.1)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--save-every-epoch", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -135,10 +142,20 @@ def compute_losses(
     future_recon_weight: float,
     latent_weight: float,
     foreground_weight: float,
+    pred_l1_weight: float,
+    pred_bce_weight: float,
+    pred_mse_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     batch_size, pred_steps, channels, height, width = future.shape
     pixel_weights = 1.0 + foreground_weight * future
-    pred_loss = torch.mean(pixel_weights * (outputs["pred_frames"] - future) ** 2)
+    pred_diff = outputs["pred_frames"] - future
+    pred_l1 = torch.mean(pixel_weights * torch.abs(pred_diff))
+    pred_mse = torch.mean(pixel_weights * pred_diff.square())
+    if "pred_frame_logits" in outputs:
+        pred_bce = F.binary_cross_entropy_with_logits(outputs["pred_frame_logits"], future, weight=pixel_weights)
+    else:
+        pred_bce = F.binary_cross_entropy(outputs["pred_frames"].clamp(1e-6, 1.0 - 1e-6), future, weight=pixel_weights)
+    pred_loss = pred_l1_weight * pred_l1 + pred_bce_weight * pred_bce + pred_mse_weight * pred_mse
     total_loss = pred_loss
 
     recon_loss = future.new_tensor(0.0)
@@ -146,7 +163,10 @@ def compute_losses(
     future_recon_loss = future.new_tensor(0.0)
 
     if "recon_context" in outputs and recon_weight > 0.0:
-        recon_loss = F.mse_loss(outputs["recon_context"], context)
+        if "recon_context_logits" in outputs:
+            recon_loss = F.binary_cross_entropy_with_logits(outputs["recon_context_logits"], context)
+        else:
+            recon_loss = F.mse_loss(outputs["recon_context"], context)
         total_loss = total_loss + recon_weight * recon_loss
 
     if "pred_latents" in outputs and latent_weight > 0.0 and hasattr(model, "encoder") and hasattr(model, "decoder"):
@@ -166,16 +186,19 @@ def compute_losses(
         total_loss = total_loss + latent_weight * latent_loss
 
         if future_recon_weight > 0.0:
-            future_reconstruction = model.decoder(
-                target_future_latents.reshape(batch_size * pred_steps, latent_channels, latent_height, latent_width)
+            future_reconstruction_logits = model.decode_latents(
+                target_future_latents,
+                apply_sigmoid=False,
             )
-            future_reconstruction = future_reconstruction.reshape(batch_size, pred_steps, channels, height, width)
-            future_recon_loss = F.mse_loss(future_reconstruction, future)
+            future_recon_loss = F.binary_cross_entropy_with_logits(future_reconstruction_logits, future)
             total_loss = total_loss + future_recon_weight * future_recon_loss
 
     metrics = {
         "loss": float(total_loss.detach().cpu()),
         "pred_loss": float(pred_loss.detach().cpu()),
+        "pred_l1": float(pred_l1.detach().cpu()),
+        "pred_bce": float(pred_bce.detach().cpu()),
+        "pred_mse": float(pred_mse.detach().cpu()),
         "recon_loss": float(recon_loss.detach().cpu()),
         "future_recon_loss": float(future_recon_loss.detach().cpu()),
         "latent_loss": float(latent_loss.detach().cpu()),
@@ -190,6 +213,13 @@ def aggregate_metric_dict(metric_dicts: list[dict[str, float]]) -> dict[str, flo
     return {key: float(np.mean([metrics[key] for metrics in metric_dicts])) for key in keys}
 
 
+def compute_teacher_force_ratio(args: argparse.Namespace, epoch: int) -> float:
+    if args.model != "openloop" or args.epochs <= 1:
+        return 0.0
+    progress = (epoch - 1) / max(1, args.epochs - 1)
+    return float(args.teacher_force_start + (args.teacher_force_end - args.teacher_force_start) * progress)
+
+
 def evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -200,6 +230,9 @@ def evaluate(
     future_recon_weight: float,
     latent_weight: float,
     foreground_weight: float,
+    pred_l1_weight: float,
+    pred_bce_weight: float,
+    pred_mse_weight: float,
 ) -> dict[str, float]:
     model.eval()
     collected = []
@@ -217,6 +250,9 @@ def evaluate(
                 future_recon_weight=future_recon_weight,
                 latent_weight=latent_weight,
                 foreground_weight=foreground_weight,
+                pred_l1_weight=pred_l1_weight,
+                pred_bce_weight=pred_bce_weight,
+                pred_mse_weight=pred_mse_weight,
             )
             collected.append(metrics)
     return aggregate_metric_dict(collected)
@@ -281,7 +317,16 @@ def main() -> None:
     train_loader, val_loader = make_dataloaders(args)
 
     model = build_model(args).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=4,
+    )
+    use_amp = device.type == "cuda"
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     history = []
     best_val_loss = float("inf")
@@ -298,25 +343,47 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         train_metrics = []
+        teacher_force_ratio = compute_teacher_force_ratio(args, epoch)
 
         for batch in train_loader:
             batch = batch.to(device=device, dtype=torch.float32)
             context, future = split_sequence(batch, context_frames=args.context_frames, pred_frames=args.pred_frames)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(context, pred_steps=args.pred_frames)
-            loss, metrics = compute_losses(
-                model,
-                outputs,
-                context=context,
-                future=future,
-                recon_weight=args.recon_weight,
-                future_recon_weight=args.future_recon_weight,
-                latent_weight=args.latent_weight,
-                foreground_weight=args.foreground_weight,
-            )
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast(device_type=autocast_device, enabled=use_amp):
+                if args.model == "openloop":
+                    outputs = model(
+                        context,
+                        pred_steps=args.pred_frames,
+                        future_frames=future,
+                        teacher_force_ratio=teacher_force_ratio,
+                    )
+                else:
+                    outputs = model(context, pred_steps=args.pred_frames)
+                loss, metrics = compute_losses(
+                    model,
+                    outputs,
+                    context=context,
+                    future=future,
+                    recon_weight=args.recon_weight,
+                    future_recon_weight=args.future_recon_weight,
+                    latent_weight=args.latent_weight,
+                    foreground_weight=args.foreground_weight,
+                    pred_l1_weight=args.pred_l1_weight,
+                    pred_bce_weight=args.pred_bce_weight,
+                    pred_mse_weight=args.pred_mse_weight,
+                )
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
+                optimizer.step()
+            metrics["teacher_force_ratio"] = teacher_force_ratio
             train_metrics.append(metrics)
 
         train_summary = aggregate_metric_dict(train_metrics)
@@ -330,7 +397,12 @@ def main() -> None:
             future_recon_weight=args.future_recon_weight,
             latent_weight=args.latent_weight,
             foreground_weight=args.foreground_weight,
+            pred_l1_weight=args.pred_l1_weight,
+            pred_bce_weight=args.pred_bce_weight,
+            pred_mse_weight=args.pred_mse_weight,
         )
+        scheduler.step(val_summary["loss"])
+        current_lr = float(optimizer.param_groups[0]["lr"])
         epoch_summary = {"epoch": epoch, "train": train_summary, "val": val_summary}
         history.append(epoch_summary)
 
@@ -350,7 +422,8 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_summary['loss']:.4f} val_loss={val_summary['loss']:.4f} "
-            f"val_rmse={val_summary['rmse']:.4f} val_pcc={val_summary['pcc']:.4f}"
+            f"val_rmse={val_summary['rmse']:.4f} val_pcc={val_summary['pcc']:.4f} "
+            f"tf={teacher_force_ratio:.2f} lr={current_lr:.2e}"
         )
 
     best_checkpoint = torch.load(best_checkpoint_path, map_location=device)
