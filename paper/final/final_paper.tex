@@ -1,7 +1,7 @@
 \documentclass{article}
 
 \PassOptionsToPackage{numbers,compress}{natbib}
-\usepackage{neurips_2026}
+\usepackage[preprint]{neurips_2026}
 
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
@@ -14,312 +14,328 @@
 \usepackage{enumitem}
 \usepackage{graphicx}
 \usepackage{caption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
 \setlength{\emergencystretch}{2em}
 
-\title{Latent-Space Data Assimilation for Sparse-Conditioned Video Prediction}
-\author{Anonymous Author(s)}
+\title{RGDA-Tokenizer: Retrieval-Guided Data-Assimilated Tokenizer for Video Continuation}
+\author{
+Danni Yu\thanks{Equal contribution.}\\
+Tsinghua University\\
+\texttt{yudn24@mails.tsinghua.edu.cn}
+\And
+Haofeng Wang\footnotemark[1]\\
+Peking University\\
+\texttt{hfwang@stu.pku.edu.cn}
+\And
+Xuanyi Liu\footnotemark[1]\\
+Peking University
+\And
+Siyu Tao\footnotemark[1]\\
+Beihang University
+\And
+Rui Wan\footnotemark[1]\\
+Tsinghua University
+}
 
 \begin{document}
 
 \maketitle
 
 \begin{abstract}
-This report studies whether data assimilation (DA) can improve sparse-conditioned video prediction when observations are available only intermittently. The motivating view is that long-horizon open-loop video prediction is an inherently unstable extrapolation problem: model error accumulates over time unless the forecast is repeatedly re-anchored to reality. We formulate video rollout as a latent-space forecast--analysis problem, train a lightweight sequential predictor as the DA host model, and apply a latent ensemble transform Kalman filter (ETKF) at test time under simulated sparse observations derived from held-out ground truth. On Moving MNIST, the same host model improves from RMSE $0.1856$ and PCC $0.6494$ in open-loop rollout to RMSE $0.1728$ and PCC $0.6581$ with latent ETKF under noisy full-frame observations every two future steps. A checkpoint sweep shows that this improvement is consistent across training and reaches RMSE $0.1599$ and PCC $0.6817$ at epoch $28$. The report also measures entropy, relative entropy, and mutual information to characterize the uncertainty reduction produced by the assimilation step. The current always-assimilate ETKF improves accuracy but increases runtime by a factor of $2.31\times$, so the main conclusion is that latent DA is effective as a quality-improving re-anchoring mechanism, while compute-aware selective assimilation remains future work.
+Text-image-to-video continuation models such as Wan2.2 TI2V generate future motion from a text prompt and a single anchor image, which leaves a structural gap between the model's conditioning space and the richer temporal evidence available in retrieved real videos. This paper reformulates that gap as a data-assimilation problem. Given the first half of a short clip, the frozen TI2V backbone first produces its native prompt-and-image conditioning token for later-half generation. An external retrieval bank then provides top-$K$ real-video observations, which are projected into the TI2V conditioning space through an anchor-image summary, a depth summary, and a motion summary. A small trainable gain network fuses the native conditioning token and the observation innovation to produce a \emph{data-assimilated conditioning token}, which is fed into the frozen Wan DiT for later-half generation. We describe the resulting data-assimilated tokenizer, derive its frozen-backbone diffusion training objective, and specify a concrete training plan with OpenVid-1M as the retrieval corpus and MSR-VTT as the supervised continuation benchmark. The paper is intended as a clean preliminary formulation and implementation plan for retrieval-guided conditioning-space data assimilation in video continuation.
 \end{abstract}
 
 \section{Introduction}
 
-Video prediction is a natural sequential inference problem: a model observes a prefix of frames and must extrapolate plausible future states. In practice, purely open-loop predictors often drift over time, while more expressive generative models can be computationally expensive. This suggests a broader principle: long-horizon extrapolation is intrinsically fragile because local model errors compound into global instability. Data assimilation (DA) offers a different viewpoint. Instead of treating the predictor as a one-shot generator, DA decomposes the problem into a forecast step and an analysis step: first forecast the next state, then correct that forecast whenever new evidence becomes available.
+Modern video world models are increasingly deployed as latent simulators for planning, animation, and long-form generation, but their continuation mechanism is often surprisingly narrow. In Wan2.2 TI2V, the model predicts future video from a text prompt and an anchor image; in practice, that anchor is commonly the last frame from the previous clip. This interface is elegant, but it also creates a clear bottleneck: the model must infer the entire future temporal evolution from a single image token, even though related real videos may provide much richer motion and geometry evidence.
 
-This report explores that idea on a controlled benchmark. We do not study unconditional text-to-video generation, where no post-prefix observations are available and DA has no natural signal to assimilate. Instead, we study \emph{sparse-conditioned video prediction}: after observing the first $10$ frames of a Moving MNIST sequence, the model predicts the next $10$ frames and occasionally receives sparse noisy observations derived from the held-out future frames. In this sense, DA does not eliminate extrapolation; it breaks a difficult long-range extrapolation problem into a sequence of shorter forecast intervals that are repeatedly pulled back toward observed reality. This is a synthetic-observation setting, analogous to standard DA practice where partial measurements are simulated from known truth in order to validate an assimilation pipeline under controlled conditions.
+This paper argues that the missing component is not necessarily a larger prior, but a \emph{conditioning-space analysis update}. In classical data assimilation (DA), one starts from a prior state, compares it against external observations, and then computes an analysis state that better reflects the available evidence. We transfer that logic to TI2V continuation with one important clarification: the prior is \emph{not} a separately predicted future video. Instead, the first half of a 10-second clip defines the continuation context; the frozen TI2V prior forms its native prompt-and-image conditioning token; retrieved real videos act as an external observation bank; and a small gain network produces a data-assimilated continuation condition that replaces the raw conditioning token before the later-half rollout.
 
-The project goal is modest but important: determine whether a latent-space ETKF can improve prediction quality over the same trained host predictor, and measure that improvement with both frame metrics and DA uncertainty metrics. Because the course requires a complete DA workflow, the report emphasizes problem formulation, algorithm design, numerical experiments, and interpretation rather than only final accuracy. During the latest project stage, the host predictor itself was substantially strengthened, so the report now includes the repaired open-loop baseline and its longer training curve alongside the completed ETKF results from the earlier host.
+The difficult step is not retrieval itself. The real difficulty is that the retrieved observation is a \emph{video}, while TI2V conditions on an \emph{image-plus-text} conditioning space. We therefore compress each retrieved clip into an anchor-image observation and a compact temporal observation consisting of depth and motion summaries. This converts the heterogeneous retrieved video into a structured observation that can be compared with the native TI2V condition in a common space. The resulting method preserves the DA interpretation:
+\begin{enumerate}[leftmargin=1.2em]
+    \item form the native prompt-and-image conditioning token from the frozen TI2V prior,
+    \item retrieve observation videos from an external corpus,
+    \item project those videos into a shared observation space,
+    \item compute an innovation,
+    \item produce a data-assimilated conditioning token with a single trainable gain network.
+\end{enumerate}
+
+The goal of the current draft is to make this formulation concrete enough to implement. We therefore focus on the conditioning-token design, the training objective, the dataset split between retrieval and supervised learning, and a practical training loop rather than claiming final benchmark results.
 
 \section{Related Work}
 
-DA and machine learning share a common Bayesian structure. \citet{buizza2022data} emphasize that latent and reduced-order spaces are especially attractive when the original state is high-dimensional, which makes latent-space video prediction a natural candidate for DA. Recent generative DA work also shows that learned priors can support state estimation under sparse observations \citep{manshausen2024generative, zheng2024ensemble}. At the same time, \citet{hodyss2025using} caution that exact posterior matching in diffusion-based DA may become computationally awkward, which motivates our choice to apply DA around a lightweight predictor rather than to build a fully diffusion-native assimilation pipeline.
+\paragraph{World models and long-horizon rollout.}
+Latent world models compress observations into a state representation and then evolve that representation forward with a learned dynamics model. This design underlies both classical latent control architectures and modern generative world models. \citet{ha2018world} made the paradigm explicit by separating representation, memory, and control, while recent surveys argue that modern video generators are increasingly being interpreted through a world-model lens \citep{videoworldmodelsreview2026, mechanisticview2026}. A large 2025--2026 line of work attacks long-horizon drift by strengthening state persistence, memory, or context. Examples include retrieval- or state-conditioned video world models \citep{chen2025interactiveworldmodels, icworld2025}, compressed or explicit spatial memory \citep{worldpack2025, evoworld2025}, longer-horizon embodied rollouts with mixture-of-experts or closed-loop training \citep{longscape2025, worldinworld2025}, and persistent or embodiment-aware latent states \citep{persistentworld2025, bridgev2w2026}. These works demonstrate that better state representations and memory mechanisms are critical, but they still largely handle external evidence through conditioning, retrieval augmentation, or latent persistence rather than through an explicit prior--observation--analysis state-correction step.
 
-On the video side, modern predictive baselines such as MCVD, Latent-Shift, and SimVP show that latent structure and efficient temporal modeling are critical design ingredients \citep{voleti2022mcvd, an2023latentshift, gao2022simvp}. In this report, SimVP serves as a literature-aware reference baseline, while a compact recurrent latent predictor is used as the DA host because it exposes a stepwise forecast state that can be corrected by ETKF.
+\paragraph{Retrieval, external memory, and observation sources.}
+Retrieval and external memory have become common tools for improving video realism and long-horizon coherence. Retrieval-augmented generation appears in systems such as \citet{ragme2025} and \citet{chen2025interactiveworldmodels}, while explicit memory banks or persistent scene stores are central to \citet{worldpack2025}, \citet{evoworld2025}, and \citet{icworld2025}. In most of these methods, retrieved evidence is used as conditioning context, as a state prompt, or as an auxiliary memory. Our formulation is deliberately narrower and more explicit: retrieved evidence is converted into a structured observation, weighted through a retrieval-dependent operator, and assimilated into the latent state estimate. This distinction is essential because it turns retrieval from a conditioning heuristic into a measurable source of new information.
 
-\section{Problem Formulation}
+\paragraph{Multimodal retrieval and dataset support.}
+Our training plan depends on an observation bank that is both prompt-annotated and large enough to supply semantically related real clips. OpenVid-1M is one of the strongest current choices for this role because it provides over one million text-video pairs and a curated high-definition subset \citep{openvid2025}. For retrieval and prompt-alignment scoring we use LanguageBind, which places text, image, video, and depth features into a shared representation space \citep{languagebind2024}. For supervised token learning on fixed-length clips, MSR-VTT is a practical complementary benchmark because it provides 10K caption-annotated web videos and a widely used public train/test split \citep{xu2016msrvtt}.
 
-Let $x_t \in \mathbb{R}^{H \times W}$ denote the video frame at time $t$, and let $z_t$ denote a latent representation of that frame. We use an encoder--decoder pair
-\begin{align}
-    z_t &= E(x_t), \\
-    x_t &= D(z_t).
-\end{align}
+\paragraph{Data assimilation with learned and generative priors.}
+DA provides a principled answer to sequential state estimation under model error and partial observations. The broader DA literature has already argued that latent and reduced-order spaces are natural places to fuse machine learning with estimation \citep{buizza2022data}. More recent work combines DA with learned priors or generative models, including sparse-observation weather DA \citep{manshausen2024generative}, derivative-free ensemble guidance for diffusion models \citep{zheng2024ensemble}, stochastic-interpolant DA \citep{chen2025flowdas}, and diffusion or flow-based perspectives on posterior correction and sequential warm starts \citep{hodyss2025using, scholz2025warm, huang2026accelerated}. These papers show that DA-style correction remains useful even when the predictive prior is highly expressive. However, they are not focused on world models with retrieved visual memory, geometric observation operators, or long-horizon video drift. That gap is where our method sits.
 
-The latent forecast model is written as
+\paragraph{Geometry-aware observations.}
+To make retrieved evidence useful for state estimation, the observation should be structured rather than purely raw RGB. Monocular geometry estimators such as Depth Anything V2 \citep{yang2024depthanythingv2} offer a practical route: convert retrieved real clips into depth-aware observations that describe scene layout and coarse 3D consistency. In our setting, depth is not treated as full physical supervision; rather, it supplies a stable geometry summary that complements the anchor image and motion summaries when projecting retrieved videos into TI2V token space.
+
+\section{Preliminaries}
+
+\subsection{TI2V Continuation Setting}
+
+Let a supervised clip be a prompt-annotated 10-second video
 \begin{equation}
-    z_{t+1}^{f} = M_{\theta}(z_{t}^{a}) + \eta_{t+1},
+    x = (x_1,\dots,x_T), \qquad p \in \mathcal{P},
 \end{equation}
-where $z_{t+1}^{f}$ is the forecast latent state, $z_t^{a}$ is the previous analysis state, $M_{\theta}$ is the learned predictor, and $\eta_{t+1}$ represents forecast uncertainty.
-
-Observations arrive through
+with midpoint split
 \begin{equation}
-    y_{t+1} = H(x_{t+1}) + \epsilon_{t+1},
+    x^{\mathrm{ctx}} = x_{1:T/2}, \qquad x^{\mathrm{tgt}} = x_{T/2+1:T}.
 \end{equation}
-where $H$ is the observation operator and $\epsilon_{t+1}$ is observation noise. In this project, $H$ is synthetic but controlled: it may reveal a full frame, a masked subset of pixels, or a low-resolution version of the true future frame.
-
-The analysis step combines the forecast with the observation:
+In Wan2.2 TI2V \citep{wan2026}, the later-half continuation is conditioned primarily on the last available image and the text prompt. We therefore define
 \begin{equation}
-    z_{t+1}^{a} = z_{t+1}^{f} + K_{t+1}\left(y_{t+1} - H(D(z_{t+1}^{f}))\right),
+    I_{\mathrm{last}} = x_{T/2},
 \end{equation}
-where the Kalman gain is estimated from the latent ensemble. This gives the core DA loop used in the project:
+and let the frozen TI2V context encoder produce the native continuation-conditioning token
+\begin{equation}
+    c^{0} = C_{\mathrm{wan}}(I_{\mathrm{last}}, p).
+\end{equation}
+The target future clip is still encoded into latent space through the frozen Wan tokenizer or VAE:
+\begin{equation}
+    z^{\mathrm{tgt}} = E_{\mathrm{wan}}(x^{\mathrm{tgt}}).
+\end{equation}
+The token $c^{0}$ is the \emph{base conditioning token}: the native TI2V condition computed directly from the prompt and last context frame before any data-assimilation update. The latent $z^{\mathrm{tgt}}$ is the supervised target latent for the actual later half.
+
+\subsection{Retrieval Memory and Shared Embedding Space}
+
+We assume a retrieval bank
+\begin{equation}
+    \mathcal{R} = \{(r_i, c_i)\}_{i=1}^{N},
+\end{equation}
+where $r_i$ is a real video clip and $c_i$ is its caption. A LanguageBind encoder \citep{languagebind2024} maps text, image, and video inputs into a shared embedding space. Given the prompt and the last context frame, we build the retrieval query
+\begin{equation}
+    q = Q_{\mathrm{LB}}(p, I_{\mathrm{last}}),
+\end{equation}
+retrieve the top-$K$ clips, and compute normalized weights
+\begin{equation}
+    \alpha_k = \frac{\exp(s(q,r_k)/\tau)}{\sum_{j=1}^{K}\exp(s(q,r_j)/\tau)}.
+\end{equation}
+
+\subsection{Observation Summaries}
+
+The retrieved observation is a video, but the TI2V conditioning space is centered on image-plus-text inputs. To bridge that mismatch, we summarize each retrieved clip with three components:
 \begin{enumerate}[leftmargin=1.2em]
-    \item forecast the next latent state cheaply,
-    \item project the forecast into observation space,
-    \item compare it with the available measurement,
-    \item update the latent state by ETKF,
-    \item continue the rollout from the corrected state.
+    \item an \emph{anchor-image observation} for appearance and scene identity,
+    \item a \emph{depth observation} for geometry,
+    \item a \emph{motion observation} for temporal evolution.
 \end{enumerate}
+
+Let $\Psi(\cdot)$ be a frozen depth extractor such as Depth Anything V2, and let $\Phi(\cdot)$ be a frozen motion extractor such as dense optical flow. These operators define the observation space that will later be compared with the base conditioning token.
 
 \section{Method}
 
-\subsection{Predictors}
+\subsection{Overview}
 
-Two predictor roles are used in the experiments.
-
-\paragraph{SimVP reference baseline.}
-We train a compact SimVP-style predictor as a literature-aware reference baseline. It takes the first $10$ frames as input and predicts the next $10$ frames directly. This baseline is useful as an external reference, but it is not used inside the DA loop.
-
-\paragraph{Open-loop DA host model.}
-The DA host is a lightweight \texttt{OpenLoopVideoPredictor}. It contains:
+Our method trains exactly one new module: a \emph{data-assimilated tokenizer} or \emph{gain network} $G_{\phi}$. Everything else remains frozen, including Wan2.2 TI2V, LanguageBind, Depth Anything V2, and the retrieval index. The method is organized into four steps:
 \begin{enumerate}[leftmargin=1.2em]
-    \item a convolutional encoder that maps frames to latent feature maps,
-    \item a ConvLSTM recurrent state that carries temporal information,
-    \item a residual latent update head,
-    \item a convolutional decoder that maps predicted latent states back to frames.
+    \item obtain the native TI2V conditioning token from the prompt and context image;
+    \item retrieve top-$K$ real clips and project them into a shared observation summary;
+    \item compute the innovation between the conditioning-side summary and the observation summary;
+    \item predict a token correction that turns the native conditioning token into a data-assimilated continuation token.
 \end{enumerate}
 
-Given the first $10$ frames, the host encodes them, updates the ConvLSTM hidden state, and stores the last latent feature map as the initial forecast state. Each future step is then predicted by rolling the latent state forward in open loop. This stepwise state representation is why the DA host is suitable for ETKF.
+\subsection{Base Conditioning Token from the Frozen TI2V Prior}
 
-\subsection{Open-Loop Training Formulation}
-
-The open-loop host is trained as a deterministic future predictor before any assimilation is applied. Let the observed context frames be $x_{1:T_c}$ and the target future frames be $x_{T_c+1:T_c+T_p}$, with $T_c=T_p=10$ in the completed experiments. Each context frame is encoded into a latent feature map,
+Although the supervised training clip provides the full first-half context, the frozen TI2V model only receives the same conditioning interface it will see at inference time: the last context frame and the text prompt. Let
 \begin{equation}
-    z_t = E(x_t), \qquad t = 1, \dots, T_c.
+    c^{0} = C_{\mathrm{wan}}(I_{\mathrm{last}}, p)
 \end{equation}
-The encoded context sequence is then processed by the ConvLSTM to produce the initial recurrent state $(h_{T_c}, c_{T_c})$ and the last context latent $z_{T_c}$.
+be the native conditioning token generated by the frozen Wan2.2 TI2V prompt-and-image pathway. Importantly, $c^{0}$ is \emph{not} obtained by first generating a future clip and then re-encoding that clip. It is the DiT input condition itself, before any data-assimilation correction is applied.
 
-During forecasting, the predictor rolls forward autoregressively in latent space:
-\begin{align}
-    h_{t+1}, c_{t+1} &= \mathrm{ConvLSTM}(z_t, h_t, c_t), \\
-    \hat{z}_{t+1} &= z_t + G(h_{t+1}), \\
-    \hat{x}_{t+1} &= D(\hat{z}_{t+1}),
-\end{align}
-where $G$ is the residual latent prediction head. The residual form is important: instead of predicting the next latent from scratch, the model predicts a correction to the previous latent state. In open-loop rollout, the predicted latent $\hat{z}_{t+1}$ is fed back as the next input latent. This is exactly the source of drift that later motivates ETKF correction.
+\subsection{Projecting Retrieved Videos into TI2V Observation Space}
 
-The main training objective is a foreground-weighted future-frame prediction loss,
+The retrieved observation is a video with nontrivial temporal structure, while TI2V expects image-centered conditioning. We therefore summarize each retrieved clip $r_k$ into an anchor-image token, a depth token, and a motion token.
+
+We first choose the anchor frame
 \begin{equation}
-    \mathcal{L}_{\mathrm{pred}}
+    \tilde{I}_k = r_{k,u^\star},
+    \qquad
+    u^\star = \arg\max_{u}\cos\!\big(E_{\mathrm{img}}(r_{k,u}), E_{\mathrm{img}}(I_{\mathrm{last}})\big),
+\end{equation}
+which selects the retrieved frame most compatible with the current context boundary.
+
+We then define the per-clip observation summary
+\begin{equation}
+    y_k^{o}
     =
-    \frac{1}{T_p N}
-    \sum_{t=1}^{T_p}\sum_{i=1}^{N}
-    w_{t,i}\big(\hat{x}_{T_c+t,i} - x_{T_c+t,i}\big)^2,
+    \operatorname{concat}\!\Big(
+    E_{\mathrm{img}}(\tilde{I}_k),
+    E_{\mathrm{depth}}(\Psi(r_k)),
+    E_{\mathrm{mot}}(\Phi(r_k))
+    \Big),
 \end{equation}
-where $N$ is the number of pixels in one frame and the pixel weights are
+where $E_{\mathrm{img}}$, $E_{\mathrm{depth}}$, and $E_{\mathrm{mot}}$ are frozen summary encoders on top of LanguageBind image features, depth features, and motion features respectively. The retrieved observation is the weighted average
 \begin{equation}
-    w_{t,i} = 1 + \lambda_{\mathrm{fg}} x_{T_c+t,i}.
+    y^{o} = \sum_{k=1}^{K}\alpha_k\,y_k^{o}.
 \end{equation}
-This weighting emphasizes digit pixels over the mostly black background and discourages the trivial low-energy solution where the predictor outputs nearly blank frames.
 
-To stabilize the latent representation, training also includes three auxiliary losses:
-\begin{align}
-    \mathcal{L}_{\mathrm{recon}} &= \mathrm{MSE}\big(D(E(x_{1:T_c})), x_{1:T_c}\big), \\
-    \mathcal{L}_{\mathrm{latent}} &= \mathrm{MSE}\big(\hat{z}_{T_c+1:T_c+T_p}, E(x_{T_c+1:T_c+T_p})\big), \\
-    \mathcal{L}_{\mathrm{future\_recon}} &= \mathrm{MSE}\big(D(E(x_{T_c+1:T_c+T_p})), x_{T_c+1:T_c+T_p}\big).
-\end{align}
-The first term regularizes the context autoencoding path, the second directly supervises the predicted latent rollout, and the third keeps the decoder aligned with future-frame latents.
-
-The total host-training objective is
+The native TI2V conditioning token is projected into the same space through a frozen summary operator
 \begin{equation}
-    \mathcal{L}
+    y^{0} = H(c^{0}).
+\end{equation}
+The resulting innovation is
+\begin{equation}
+    r = y^{o} - y^{0}.
+\end{equation}
+This is the key DA quantity: it measures how the retrieved observation disagrees with the native TI2V condition in a common observation space even though the original modalities differ.
+
+\subsection{Data-Assimilated Tokenizer}
+
+Let
+\begin{equation}
+    e_p = E_{\mathrm{text}}(p), \qquad e_I = E_{\mathrm{img}}(I_{\mathrm{last}})
+\end{equation}
+denote the prompt embedding and the last-frame embedding. The only trainable module is the gain network
+\begin{equation}
+    \Delta c = G_{\phi}\!\big(\operatorname{concat}(c^{0}, y^{0}, y^{o}, r, e_p, e_I)\big),
+\end{equation}
+which predicts a token correction with the same dimensionality as the conditioning token. The final data-assimilated token is
+\begin{equation}
+    c^{a} = c^{0} + \Delta c.
+    \label{eq:data-assimilated-token}
+\end{equation}
+At inference time, $c^{a}$ replaces $c^{0}$ as the later-half continuation condition that is fed into the frozen Wan DiT tail for second-half generation.
+
+\subsection{Training Objective}
+
+Because the gain network modifies the DiT input condition rather than directly predicting a target video token, the natural objective is the frozen Wan diffusion likelihood on the ground-truth later half. Let
+\begin{equation}
+    z_t^{\mathrm{noisy}} = \alpha_t z^{\mathrm{tgt}} + \sigma_t \epsilon,
+    \qquad
+    \epsilon \sim \mathcal{N}(0, I),
+\end{equation}
+denote the standard noised target latent used by the frozen Wan diffusion objective. The gain network is trained through the frozen denoiser
+\begin{equation}
+    \hat{\epsilon} = \epsilon_{\theta}\!\big(z_t^{\mathrm{noisy}}, t \mid c^{a}\big),
+\end{equation}
+and optimized with the usual denoising surrogate
+\begin{equation}
+    \mathcal{L}_{\mathrm{diff}}
     =
-    \mathcal{L}_{\mathrm{pred}}
-    + \lambda_{\mathrm{recon}}\mathcal{L}_{\mathrm{recon}}
-    + \lambda_{\mathrm{future\_recon}}\mathcal{L}_{\mathrm{future\_recon}}
-    + \lambda_{\mathrm{latent}}\mathcal{L}_{\mathrm{latent}}.
-\end{equation}
-In the completed runs, the default weights were $\lambda_{\mathrm{recon}}=0.1$, $\lambda_{\mathrm{future\_recon}}=0.1$, $\lambda_{\mathrm{latent}}=0.5$, and $\lambda_{\mathrm{fg}}=6.0$.
-
-\subsection{Observation Model}
-
-The observation operator is implemented as a \texttt{SparseObservationOperator}. It supports:
-\begin{enumerate}[leftmargin=1.2em]
-    \item \texttt{full}: the entire frame is observed,
-    \item \texttt{masked}: only a fixed subset of pixels is observed,
-    \item \texttt{lowres}: a downsampled frame is observed.
-\end{enumerate}
-
-The current completed L40 experiment uses the \texttt{full} operator with observations every two future steps and additive Gaussian observation noise with standard deviation $0.02$. Over a $10$-step future rollout, this produces $5$ assimilation events.
-
-\subsection{Latent ETKF Update}
-
-At each assimilation step, we sample a small ensemble of latent states around the current forecast state, propagate each member forward through the host model, decode those members into observation space, and apply an ETKF update in latent space. The updated latent ensemble mean is then decoded as the corrected frame and passed to the next forecast step.
-
-\subsection{Metrics}
-
-The report uses both predictive and DA-specific metrics.
-
-\paragraph{Prediction metrics.}
-For a predicted frame sequence $\hat{x}$ and target sequence $x$,
-\begin{equation}
-    \mathrm{RMSE} = \sqrt{\frac{1}{N}\sum_{i=1}^{N}(\hat{x}_i - x_i)^2},
-\end{equation}
-and the pattern correlation coefficient (PCC) is
-\begin{equation}
-    \mathrm{PCC} =
-    \frac{\sum_i (\hat{x}_i - \bar{\hat{x}})(x_i - \bar{x})}
-    {\sqrt{\sum_i(\hat{x}_i - \bar{\hat{x}})^2}\sqrt{\sum_i(x_i - \bar{x})^2}}.
-\end{equation}
-
-\paragraph{Uncertainty metrics.}
-Let the forecast and analysis latent distributions be approximated as diagonal Gaussians with means $(\mu_f, \mu_a)$ and variances $(\sigma_f^2, \sigma_a^2)$.
-Forecast entropy is
-\begin{equation}
-    H_f \approx \frac{1}{2d}\sum_{i=1}^{d}\log(2\pi e \sigma_{f,i}^2).
-\end{equation}
-Relative entropy is the diagonal Gaussian KL divergence
-\begin{equation}
-    D_{\mathrm{KL}}(p^a \| p^f)
-    \approx
-    \frac{1}{2d}\sum_{i=1}^{d}
+    \mathbb{E}_{t,\epsilon}
     \left[
-    \log\frac{\sigma_{f,i}^2}{\sigma_{a,i}^2}
-    +
-    \frac{\sigma_{a,i}^2 + (\mu_{a,i}-\mu_{f,i})^2}{\sigma_{f,i}^2}
-    - 1
+    \|\hat{\epsilon} - \epsilon\|_2^2
     \right].
+    \label{eq:token-loss}
 \end{equation}
-Mutual information is approximated by the entropy drop:
+Only the gain network parameters $\phi$ are updated; the Wan backbone parameters $\theta$ remain frozen. In the first implementation, this is the only training loss. We do not add an adversarial discriminator or a separate perceptual objective. The goal is to isolate whether the gain network can learn a useful conditioning-space analysis update by itself.
+
+\section{Derivations}
+
+The conditioning-space DA update in Eq.~\eqref{eq:data-assimilated-token} can be read as a nonlinear Kalman-style analysis step. In our TI2V setting, the DA prior is the native conditioning token itself rather than a separately predicted video. If the base conditioning token $c^{0}$ plays the role of a prior state and the observation summary $y^{o}$ defines a noisy measurement, then a classical linear DA update would take the form
 \begin{equation}
-    I \approx \frac{1}{2d}\sum_{i=1}^{d}\log\frac{\sigma_{f,i}^2}{\sigma_{a,i}^2}.
+    c^{a} = c^{0} + K r,
 \end{equation}
-These three metrics help interpret whether the forecast is uncertain, how strongly the analysis changes the forecast, and how much uncertainty the observation removes.
+for some gain matrix $K$. Our gain network simply replaces the fixed linear gain with a learned nonlinear map:
+\begin{equation}
+    K r \;\;\leadsto\;\; G_{\phi}\!\big(\operatorname{concat}(c^{0}, y^{0}, y^{o}, r, e_p, e_I)\big).
+\end{equation}
+This preserves the prior--innovation--analysis structure while allowing the correction to depend on prompt semantics, anchor-image content, and observation quality.
 
-\section{Experimental Setup}
+Under the frozen diffusion model in Eq.~\eqref{eq:token-loss}, the gain network is optimized entirely through the later-half denoising objective of the frozen TI2V backbone. The current training plan therefore asks a direct question: can a single gain network learn a useful conditioning-space analysis operator while the TI2V backbone remains completely frozen?
 
-\subsection{Dataset and Task}
+\section{Experiments and Training Plan}
 
-All completed experiments use Moving MNIST. Each sequence contains $20$ grayscale frames at resolution $64 \times 64$ with two moving digits. The prediction task is:
-\begin{itemize}[leftmargin=1.2em]
-    \item context: first $10$ frames,
-    \item target: next $10$ frames.
-\end{itemize}
+\subsection{Datasets}
 
-\subsection{Training Setup}
+\paragraph{Retrieval bank.}
+We use OpenVid-1M as the external observation memory \citep{openvid2025}. Each entry provides a caption and a real video clip, making it suitable for prompt-conditioned retrieval. In the implementation phase, we download a storage-bounded subset of the public Hugging Face mirror \texttt{lodestones/OpenVid-1M} and build the retrieval index only from this corpus; the retrieval bank is never used as a supervised target.
 
-The SimVP reference baseline was trained for $50$ epochs on $4000$ training sequences with $800$ validation sequences. The latest repaired DA host model was trained for $300$ epochs on $6000$ training sequences with $1200$ validation sequences. This host uses latent dimension $96$, hidden dimension $192$, batch size $32$, AdamW, scheduled latent teacher forcing, and the stronger open-loop objective described above.
+\paragraph{Supervised train/validation/test set.}
+We use MSR-VTT as the supervised continuation dataset \citep{xu2016msrvtt}. MSR-VTT contains 10K caption-annotated web videos with a standard 9K/1K train/test split. For implementation convenience, we download the public Hugging Face mirror \texttt{VLM2Vec/MSR-VTT}. We reserve 1K clips from the 9K training portion for validation and use the remaining 8K clips for training. Since MSR-VTT clip durations vary, we extract a canonical 10-second window per clip before splitting it into a 5-second context half and a 5-second target half.
 
-\subsection{DA Evaluation Setup}
+\paragraph{Data separation.}
+The retrieval bank and the supervised continuation dataset are disjoint by construction: OpenVid-1M is used only for retrieval, while MSR-VTT is used only for supervised training and evaluation. This avoids label leakage from the observation bank into the target continuation clips.
 
-The completed DA evaluation uses:
-\begin{itemize}[leftmargin=1.2em]
-    \item ensemble size $8$,
-    \item latent noise $0.03$,
-    \item hidden and cell noise $0.01$,
-    \item noisy full-frame observations every two future steps,
-    \item $128$ validation sequences for the main open-loop versus ETKF comparison,
-    \item $64$ validation sequences for the checkpoint sweep.
-\end{itemize}
+\subsection{Preprocessing and Cached Features}
 
-The observations are generated from held-out ground-truth future frames. This is not used during training. It is a synthetic-observation benchmark designed to validate the DA mechanism under controlled conditions.
+All supervised clips are resampled to a fixed frame rate and resolution supported by the frozen Wan TI2V pipeline. For each MSR-VTT clip we store:
+\begin{enumerate}[leftmargin=1.2em]
+    \item the first-half context clip $x^{\mathrm{ctx}}$,
+    \item the last context frame $I_{\mathrm{last}}$,
+    \item the ground-truth second-half target clip $x^{\mathrm{tgt}}$,
+    \item the native TI2V conditioning token $c^{0} = C_{\mathrm{wan}}(I_{\mathrm{last}}, p)$,
+    \item the Wan target latent $z^{\mathrm{tgt}} = E_{\mathrm{wan}}(x^{\mathrm{tgt}})$.
+\end{enumerate}
 
-\section{Results}
+For the OpenVid retrieval bank we precompute and cache:
+\begin{enumerate}[leftmargin=1.2em]
+    \item LanguageBind text and video embeddings,
+    \item depth summaries from Depth Anything V2,
+    \item motion summaries from a frozen flow extractor,
+    \item metadata needed to recover the original clip path and frames.
+\end{enumerate}
+This makes the online training loop lightweight: Wan TI2V is used only to encode the native continuation condition and evaluate the frozen denoising objective, retrieval is performed over cached embeddings, and only the gain network is updated.
 
-\subsection{Reference Baseline and Host Training}
+\subsection{Training Procedure}
 
-Table~\ref{tab:main-results} summarizes the main completed metrics for the finished DA comparison. In parallel, the repaired long-run host substantially improved the open-loop baseline itself: the best checkpoint by the total validation loss occurs at epoch $49$ with validation loss $0.2517$, RMSE $0.1500$, and PCC $0.7653$, while the final epoch $300$ reaches RMSE $0.1430$ and PCC $0.7738$ even though the total loss is slightly worse than the selected checkpoint. This is exactly the behavior visible in Figure~\ref{fig:host-training}: the training objective prefers an earlier checkpoint, but the late-epoch frame metrics keep improving.
+The training procedure follows the exact prior--analysis structure in the method section.
+\begin{enumerate}[leftmargin=1.2em]
+    \item Freeze Wan2.2 TI2V, LanguageBind, Depth Anything V2, and the motion extractor.
+    \item For each MSR-VTT training clip, keep only the last frame of the first half and the prompt as TI2V input.
+    \item Use the frozen Wan prompt-and-image encoder path to build the native conditioning token $c^{0}$.
+    \item Build a LanguageBind retrieval query from the prompt and the last context frame.
+    \item Retrieve the top-$K$ OpenVid clips and compute the weighted observation summary $y^{o}$.
+    \item Compute the conditioning-side summary $y^{0}$ and innovation $r = y^{o} - y^{0}$.
+    \item Run the gain network to obtain the assimilated conditioning token $c^{a}$.
+    \item Optimize only the frozen Wan denoising loss in Eq.~\eqref{eq:token-loss}.
+\end{enumerate}
 
-\begin{table}[t]
-    \centering
-    \caption{Main completed results on Moving MNIST. Entropy, relative entropy, and mutual information apply to the DA run because they are defined from the forecast--analysis distributions.}
-    \label{tab:main-results}
-    \begin{tabular}{lcccccc}
-        \toprule
-        Method & RMSE & PCC & Entropy & Rel. Ent. & MI & Runtime \\
-        \midrule
-        SimVP reference baseline & 0.1942 & 0.5964 & -- & -- & -- & -- \\
-        Open-loop DA host (eval) & 0.1856 & 0.6494 & -- & -- & -- & $1.00\times$ \\
-        DA host + latent ETKF & 0.1728 & 0.6581 & -5.8485 & 352.4325 & 0.5677 & $2.31\times$ \\
-        \bottomrule
-    \end{tabular}
-\end{table}
+In the first implementation, we use AdamW with a single learning rate for $G_{\phi}$, mixed precision, and early stopping on MSR-VTT validation denoising loss. Because only one small network is trained, this loop is substantially cheaper than fine-tuning the full Wan prior.
 
-Figure~\ref{fig:host-training} shows the latest $300$-epoch training history of the repaired open-loop host. Validation loss decreases sharply early on and then flattens, while RMSE and PCC continue to improve later in training. This confirms the practical issue observed during experimentation: the checkpoint selected by the total loss is not identical to the visually strongest late-epoch forecast checkpoint.
+\subsection{Planned Evaluation}
 
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=\linewidth]{../../outputs/server_baseline_result/openloop_host_repair_v2_long_training_curves.png}
-    \caption{Latest repaired open-loop host training curves on the L40 server. The figure shows train/validation loss, RMSE, and PCC over the full $300$-epoch run. The total loss prefers an earlier checkpoint, while RMSE/PCC continue improving later in training.}
-    \label{fig:host-training}
-\end{figure}
+The primary training metric is the frozen Wan denoising loss on the MSR-VTT validation set. We also plan to decode the assimilated continuation with the frozen Wan decoder and report three secondary continuation metrics:
+\begin{enumerate}[leftmargin=1.2em]
+    \item later-half reconstruction quality against the ground-truth target half,
+    \item depth residual between decoded continuation and target continuation,
+    \item transition smoothness between the last context frame and the first frames of the generated second half.
+\end{enumerate}
+For the first project milestone, we prioritize a small number of qualitative case studies to verify that the data-assimilated token changes the later-half rollout in a meaningful way before scaling to a larger benchmark sweep.
 
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=\linewidth]{../../outputs/server_baseline_result/openloop_host_repair_v2_long_sample_predictions.png}
-    \caption{Qualitative prediction grid from the latest repaired open-loop host. The top row is the $10$ observed context frames, the middle row is the ground-truth future, and the bottom row is the predicted future. The repaired host preserves coarse motion and digit identity much better than the earlier collapsed baseline, but it still blurs the two-digit structure in later forecast steps.}
-    \label{fig:latest-openloop-qualitative}
-\end{figure}
+\subsection{Training Loop Pseudocode}
 
-\subsection{Open-Loop versus Latent ETKF}
-
-The main completed DA result is a like-for-like comparison on the earlier completed host checkpoint. Open-loop rollout gives RMSE $0.1856$ and PCC $0.6494$, while latent ETKF reduces RMSE to $0.1728$ and raises PCC to $0.6581$. This is a clear quality improvement under sparse observations. The tradeoff is compute: always-assimilate ETKF costs $2.31\times$ the open-loop runtime.
-
-Figure~\ref{fig:openloop-vs-da} visualizes this final comparison. The key result is not that ETKF is cheaper; it is that ETKF provides a meaningful correction signal that improves the same host predictor under controlled sparse observations. A repaired-host ETKF rerun was prepared after the stronger open-loop host became available, but that specific rerun was not completed in time for this draft because the lab-server connection timed out during submission.
-
-\begin{figure}[t]
-    \centering
-    \includegraphics[width=0.92\linewidth]{../../outputs/server_da_result/openloop_vs_da_comparison.png}
-    \caption{Final evaluation on the same host checkpoint. Latent ETKF improves both RMSE and PCC relative to open-loop rollout, but with higher runtime.}
-    \label{fig:openloop-vs-da}
-\end{figure}
-
-\subsection{Latest Baseline Interpretation}
-
-The repaired host changes the baseline story in an important way. Relative to the earlier open-loop host, it clearly raises the quality ceiling before any assimilation is applied. The best-loss checkpoint from the long run is already much stronger than the earlier host used in the first ETKF comparison, and the qualitative sequence in Figure~\ref{fig:latest-openloop-qualitative} shows why: the model no longer collapses immediately, and it tracks the coarse digit motion through the rollout. At the same time, the sequence also shows the remaining weakness. The later predicted frames still blur and partially merge the two digits, which is precisely the kind of cumulative rollout drift that motivates assimilation.
-
-This stronger open-loop baseline therefore does not invalidate the DA framing. Instead, it sharpens the next experimental question: once the host itself is no longer obviously weak, how much additional benefit does latent ETKF still provide on the repaired checkpoint selected by the total validation loss? That repaired-host ETKF rerun is the immediate next experiment.
-
-\subsection{Interpretation of the DA Metrics}
-
-The DA run also reports entropy, relative entropy, and mutual information. These quantities are useful because RMSE and PCC only say whether the final prediction is good; they do not say \emph{why} assimilation helped or whether the update is statistically reasonable.
-
-\paragraph{Entropy.}
-Forecast entropy measures how uncertain the latent forecast distribution is before the new observation is used. In this project it is computed from the forecast ensemble variance under a diagonal Gaussian approximation. The negative entropy value in Table~\ref{tab:main-results} is not an error: it is a \emph{differential entropy} of a continuous distribution, and differential entropies can be negative when the latent variance is small. The practical interpretation is that the latent forecast is already fairly concentrated rather than wildly spread out.
-
-\paragraph{Relative entropy.}
-Relative entropy is the Kullback--Leibler divergence from the analysis distribution to the forecast distribution. It measures how strongly the assimilation step changes the model belief after an observation arrives. In this experiment, the relative entropy is large, which indicates that the observation is not merely making a cosmetic correction. Instead, the analysis step is moving the latent state in a substantial way, consistent with the fact that open-loop extrapolation accumulates drift and requires periodic re-anchoring.
-
-\paragraph{Mutual information.}
-Mutual information measures how much uncertainty is removed by the observation. In the diagonal Gaussian approximation used here, it is the entropy drop from the forecast covariance to the analysis covariance. The positive value reported in Table~\ref{tab:main-results} indicates that the observation does more than shift the posterior mean: it actually reduces posterior uncertainty. This supports the interpretation that the assimilated observation is informative rather than redundant.
-
-Taken together, these three metrics tell a coherent story. The forecast has nonzero uncertainty, the assimilation step changes the forecast in a meaningful way, and the observation reduces uncertainty. That is the statistical signature we would hope to see if DA is functioning as intended. In other words, the ETKF update is not only lowering RMSE and improving PCC, but also acting like a genuine forecast--analysis correction step rather than a heuristic post-processing trick.
+\begin{quote}
+\small
+\ttfamily
+for each minibatch $(p, x^{ctx}, x^{tgt})$ from $D^{train}_{sup}$ do\\
+\hspace*{1em}$I_{last} \leftarrow \text{last\_frame}(x^{ctx})$\\
+\hspace*{1em}$c^{0} \leftarrow C_{wan}(I_{last}, p)$ \quad // frozen Wan2.2 TI2V base condition\\
+\hspace*{1em}$z^{tgt} \leftarrow E_{wan}(x^{tgt})$\\
+\hspace*{1em}$q \leftarrow Q_{LB}(p, I_{last})$\\
+\hspace*{1em}$\{(r_k,\alpha_k)\}_{k=1}^{K} \leftarrow \text{Retrieve}(\mathcal{R}, q)$\\
+\hspace*{1em}$y^{o} \leftarrow \sum_{k=1}^{K}\alpha_k \cdot \text{ObsSummary}(r_k)$\\
+\hspace*{1em}$y^{0} \leftarrow H(c^{0})$\\
+\hspace*{1em}$r \leftarrow y^{o} - y^{0}$\\
+\hspace*{1em}$\Delta c \leftarrow G_{\phi}(\operatorname{concat}(c^{0}, y^{0}, y^{o}, r, E_{text}(p), E_{img}(I_{last})))$\\
+\hspace*{1em}$c^{a} \leftarrow c^{0} + \Delta c$\\
+\hspace*{1em}sample diffusion step $t$ and noise $\epsilon$\\
+\hspace*{1em}$z_t^{noisy} \leftarrow \alpha_t z^{tgt} + \sigma_t \epsilon$\\
+\hspace*{1em}$\hat{\epsilon} \leftarrow \epsilon_{\theta}(z_t^{noisy}, t \mid c^{a})$\\
+\hspace*{1em}$\mathcal{L} \leftarrow \|\hat{\epsilon} - \epsilon\|_2^2$\\
+\hspace*{1em}update $\phi$ with AdamW; keep all other modules frozen\\
+end for
+\end{quote}
 
 \section{Discussion}
 
-The project delivers a complete DA workflow:
-\begin{enumerate}[leftmargin=1.2em]
-    \item define a sequential latent state-space model,
-    \item train a forecast model,
-    \item define an observation operator and noise model,
-    \item perform ETKF analysis updates,
-    \item evaluate with RMSE, PCC, entropy, relative entropy, and mutual information,
-    \item interpret the results against both a reference baseline and an open-loop control.
-\end{enumerate}
+The main benefit of the revised formulation is cleanliness: one frozen TI2V prior, one retrieval bank, one observation projection, and one trainable gain network. The main risk is also clear: the projection from retrieved-video space into TI2V token space may discard temporal detail that would have been useful for continuation. This makes the anchor-image selection, depth summary, and motion summary the most important design choices in the whole pipeline. If the projected observation is poor, the innovation signal will be noisy even when retrieval itself is semantically correct.
 
-The main positive finding is that latent ETKF improves prediction quality over the same host predictor. This is a meaningful result because it validates the DA formulation on a nontrivial video task and supports the underlying philosophy of the project: reality injections can stabilize an otherwise drifting extrapolation. The main negative finding is equally important: always-assimilate ETKF is not yet a speedup. The current result improves quality but increases runtime, so the original motivation of accelerating video generation is only partially realized. The appropriate interpretation is therefore that DA currently acts as an \emph{accuracy-improving re-anchoring mechanism}, while compute-aware selective assimilation remains future work.
-
-The other central modeling decision is the observation source. In this report, observations are simulated from held-out ground truth. For a course project, this is an appropriate and standard DA benchmark design because it isolates the assimilation mechanism under controlled sparsity and noise. It would become problematic only if the future truth were revealed too densely or too directly. In our setting, the observations are sparse, noisy, and applied only at test time. The resulting experiment should therefore be read as a controlled study of how partial contact with the true future stabilizes rollout, not as a claim that future truth is freely available in deployment.
-
-There are several limitations. First, the observation study is still narrow; only the full-frame periodic observation regime has been completed end to end. Second, the strongest completed ETKF result still comes from the earlier host, while the repaired-host ETKF rerun was blocked by a temporary server timeout before completion. Third, the reference SimVP baseline in this project is a practical in-repo implementation rather than an exact benchmark-faithful reproduction of the strongest published settings. These limitations are acceptable for the course report, but they also define the most natural next experiments.
+Another limitation is that the current formulation still leaves the observation-to-condition projection implicit through the frozen summary operator $H$ and the gain network. This is intentional for the first implementation because the paper aims to test whether conditioning-space DA is useful before adding more complicated architectural structure.
 
 \section{Conclusion}
 
-This report studies latent-space DA for sparse-conditioned video prediction on Moving MNIST. A lightweight open-loop latent predictor was trained as the DA host, and a latent ETKF was applied at test time under synthetic sparse observations. The completed experiments show that ETKF improves both RMSE and PCC relative to open-loop rollout on the same host checkpoint, and that this improvement is visible across a checkpoint sweep rather than only at a single epoch.
-
-The current evidence supports the claim that DA is a useful framework for \emph{correcting} sequential video forecasts under sparse observations. More broadly, it supports the view that stable prediction of a known world should not rely on long open-loop extrapolation alone; it should be formulated as repeated local forecasting plus re-anchoring to new evidence whenever such evidence is available. The results do not yet support the stronger claim that DA speeds up video generation, because the always-assimilate ETKF remains slower than open-loop rollout. The most direct next step is therefore selective assimilation: assimilate only when the innovation, spread, or entropy is large enough to justify the cost.
+This paper updates RGDA into a more focused conditioning-space formulation for TI2V continuation. The central object is a data-assimilated tokenizer: a small gain network that receives the native prompt-and-image conditioning token, a retrieved observation summary, and their innovation, then outputs a corrected continuation condition for the frozen Wan DiT. We specify the observation projection needed to map retrieved videos into TI2V space, define a frozen-backbone diffusion training objective, and provide a concrete training plan using OpenVid-1M for retrieval and MSR-VTT for supervised continuation. This gives the project a clear next step: implement the cached retrieval pipeline, train the gain network, and evaluate whether conditioning-space data assimilation improves later-half video continuation without fine-tuning the full generator.
 
 \bibliographystyle{plainnat}
 \bibliography{project_references}
