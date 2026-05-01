@@ -6,6 +6,7 @@ __pycache__/
 
 data/
 outputs/
+weight_and_dataset/
 
 slurm_*.out
 slurm_*.err

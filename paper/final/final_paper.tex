@@ -14,11 +14,10 @@
 \usepackage{enumitem}
 \usepackage{graphicx}
 \usepackage{caption}
-\usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\usepackage{float}
 \setlength{\emergencystretch}{2em}
 
-\title{RGDA-Tokenizer: Retrieval-Guided Data-Assimilated Tokenizer for Video Continuation}
+\title{Retrieval-Guided Data Assimilation for Observation-Aware Video World Models}
 \author{
 Danni Yu\thanks{Equal contribution.}\\
 Tsinghua University\\
@@ -34,7 +33,7 @@ Peking University
 Siyu Tao\footnotemark[1]\\
 Beihang University
 \And
-Rui Wan\footnotemark[1]\\
+Ray Wan\footnotemark[1]\\
 Tsinghua University
 }
 
@@ -43,68 +42,126 @@ Tsinghua University
 \maketitle
 
 \begin{abstract}
-Text-image-to-video continuation models such as Wan2.2 TI2V generate future motion from a text prompt and a single anchor image, which leaves a structural gap between the model's conditioning space and the richer temporal evidence available in retrieved real videos. This paper reformulates that gap as a data-assimilation problem. Given the first half of a short clip, the frozen TI2V backbone first produces its native prompt-and-image conditioning token for later-half generation. An external retrieval bank then provides top-$K$ real-video observations, which are projected into the TI2V conditioning space through an anchor-image summary, a depth summary, and a motion summary. A small trainable gain network fuses the native conditioning token and the observation innovation to produce a \emph{data-assimilated conditioning token}, which is fed into the frozen Wan DiT for later-half generation. We describe the resulting data-assimilated tokenizer, derive its frozen-backbone diffusion training objective, and specify a concrete training plan with OpenVid-1M as the retrieval corpus and MSR-VTT as the supervised continuation benchmark. The paper is intended as a clean preliminary formulation and implementation plan for retrieval-guided conditioning-space data assimilation in video continuation.
+Modern image-to-video generators can be read as video world models: given a current visual state and a task description, they roll out a latent trajectory that represents how the scene may evolve. Under this view, failures of motion smoothness and physics consistency are not merely visual artifacts, but world-model state-estimation errors: the model's latent forecast drifts away from plausible real dynamics. This paper formulates retrieval-guided Video-as-Prompt inference as a data-assimilation process for observation-aware video world models. Given an input image and prompt, a retrieval memory supplies one semantically related real-video trajectory from OpenVid-style memory. This trajectory is used as the reference-video observation in the existing in-context DiT pathway, where generated latent forecast tokens interact with retrieved observation tokens. The forecast-side output is interpreted as the analysis state used for noise prediction, while forecast-to-observation attention weights provide a compatibility signal for motion smoothness and physical fidelity. As preliminary evidence, we report a Moving MNIST latent-ETKF study and a six-case qualitative pilot comparing Wan2.1-14B image-to-video baseline inference with retrieved-video inference. The pilot suggests that retrieved observations can increase scene-level motion, while also revealing blur, framing drift, and runtime costs that motivate future work.
 \end{abstract}
 
 \section{Introduction}
 
-Modern video world models are increasingly deployed as latent simulators for planning, animation, and long-form generation, but their continuation mechanism is often surprisingly narrow. In Wan2.2 TI2V, the model predicts future video from a text prompt and an anchor image; in practice, that anchor is commonly the last frame from the previous clip. This interface is elegant, but it also creates a clear bottleneck: the model must infer the entire future temporal evolution from a single image token, even though related real videos may provide much richer motion and geometry evidence.
+A useful video world model must do more than produce visually plausible frames. Following the ``Trinity of Consistency'' view of general world models, it should satisfy three coupled requirements: modal consistency, which aligns language, images, and video with the same semantic state; spatial consistency, which preserves the geometry, layout, and identity of the world; and temporal consistency, which makes the state evolve causally over time \citep{trinityconsistency2026}. This trinity is a sharper starting point for our problem than generic video quality. If a generated video violates spatial consistency, objects can drift, pop, or reappear with different geometry. If it violates temporal consistency, motion becomes jittery or physically implausible. If it violates modal consistency, the video may be smooth but no longer follow the prompt or anchor image.
 
-This paper argues that the missing component is not necessarily a larger prior, but a \emph{conditioning-space analysis update}. In classical data assimilation (DA), one starts from a prior state, compares it against external observations, and then computes an analysis state that better reflects the available evidence. We transfer that logic to TI2V continuation with one important clarification: the prior is \emph{not} a separately predicted future video. Instead, the first half of a 10-second clip defines the continuation context; the frozen TI2V prior forms its native prompt-and-image conditioning token; retrieved real videos act as an external observation bank; and a small gain network produces a data-assimilated continuation condition that replaces the raw conditioning token before the later-half rollout.
+Recent video world-model work has made the spatial part of this trinity especially visible. World-consistent diffusion models introduce explicit 3D coordinate supervision to make generated frames geometrically coherent \citep{worldconsistentdiffusion2024}. GEN3C uses a 3D cache to avoid object popping and improve world-consistent camera-controlled generation \citep{gen3c2025}. Long-term spatial memory methods explicitly store and retrieve 3D scene memory because limited temporal context causes forgetting during revisits \citep{spatialmemory2025}, while compressed memory approaches such as WorldPack improve spatial consistency by packing and retrieving past trajectories \citep{worldpack2025}. These works point to a common diagnosis: current video generators are not yet reliable world models because their latent state is weakly anchored to persistent spatial evidence and real dynamical observations.
 
-The difficult step is not retrieval itself. The real difficulty is that the retrieved observation is a \emph{video}, while TI2V conditions on an \emph{image-plus-text} conditioning space. We therefore compress each retrieved clip into an anchor-image observation and a compact temporal observation consisting of depth and motion summaries. This converts the heterogeneous retrieved video into a structured observation that can be compared with the native TI2V condition in a common space. The resulting method preserves the DA interpretation:
+However, modern text/image-to-video models typically roll out the world state without real-time observations. The model receives an anchor image and a text prompt, then predicts a video consistent with that initial state and intent \citep{wan2025}. This interface gives a strong modal condition, but once generation begins, spatial and temporal consistency are left to the model's internal prior. The model must simulate dynamics from limited conditioning, without access to external observations of how similar scenes usually evolve. The result can be temporally irregular motion, weak object persistence, and physically implausible state transitions.
+
+Inspired by classical data assimilation (DA), where a model forecast is corrected by external observations to produce an analysis state, we transfer the same logic into the DiT denoiser of an image-to-video world model. The noisy generated latent tokens are the forecast state of the world model, the single retrieved real-video token sequence is an external observation of plausible spatial-temporal evolution, and cross attention between them is the learned analysis operator that updates the representation used for noise prediction. In this framing, spatial consistency, motion smoothness, and physics fidelity become state-estimation properties: generated tokens should remain compatible with real observed dynamics in the retrieval memory.
+
+Our current contributions are:
 \begin{enumerate}[leftmargin=1.2em]
-    \item form the native prompt-and-image conditioning token from the frozen TI2V prior,
-    \item retrieve observation videos from an external corpus,
-    \item project those videos into a shared observation space,
-    \item compute an innovation,
-    \item produce a data-assimilated conditioning token with a single trainable gain network.
+    \item We frame retrieval-guided image-to-video generation as an observation-aware video world-model problem grounded in modal, spatial, and temporal consistency.
+    \item We use a single retrieved real-video trajectory as observation tokens for the forecast latent state, while relying on the existing in-context DiT pathway rather than introducing a new attention mechanism.
+    \item We connect the resulting forecast-to-observation token interaction to the classical forecast--observation--analysis structure of data assimilation and provide preliminary controlled and qualitative evidence.
 \end{enumerate}
 
-The goal of the current draft is to make this formulation concrete enough to implement. We therefore focus on the conditioning-token design, the training objective, the dataset split between retrieval and supervised learning, and a practical training loop rather than claiming final benchmark results.
+\section{Preliminaries and Preliminary Study}
 
-\section{Related Work}
+\subsection{Classical DA Framing: ETKF}
 
-\paragraph{World models and long-horizon rollout.}
-Latent world models compress observations into a state representation and then evolve that representation forward with a learned dynamics model. This design underlies both classical latent control architectures and modern generative world models. \citet{ha2018world} made the paradigm explicit by separating representation, memory, and control, while recent surveys argue that modern video generators are increasingly being interpreted through a world-model lens \citep{videoworldmodelsreview2026, mechanisticview2026}. A large 2025--2026 line of work attacks long-horizon drift by strengthening state persistence, memory, or context. Examples include retrieval- or state-conditioned video world models \citep{chen2025interactiveworldmodels, icworld2025}, compressed or explicit spatial memory \citep{worldpack2025, evoworld2025}, longer-horizon embodied rollouts with mixture-of-experts or closed-loop training \citep{longscape2025, worldinworld2025}, and persistent or embodiment-aware latent states \citep{persistentworld2025, bridgev2w2026}. These works demonstrate that better state representations and memory mechanisms are critical, but they still largely handle external evidence through conditioning, retrieval augmentation, or latent persistence rather than through an explicit prior--observation--analysis state-correction step.
-
-\paragraph{Retrieval, external memory, and observation sources.}
-Retrieval and external memory have become common tools for improving video realism and long-horizon coherence. Retrieval-augmented generation appears in systems such as \citet{ragme2025} and \citet{chen2025interactiveworldmodels}, while explicit memory banks or persistent scene stores are central to \citet{worldpack2025}, \citet{evoworld2025}, and \citet{icworld2025}. In most of these methods, retrieved evidence is used as conditioning context, as a state prompt, or as an auxiliary memory. Our formulation is deliberately narrower and more explicit: retrieved evidence is converted into a structured observation, weighted through a retrieval-dependent operator, and assimilated into the latent state estimate. This distinction is essential because it turns retrieval from a conditioning heuristic into a measurable source of new information.
-
-\paragraph{Multimodal retrieval and dataset support.}
-Our training plan depends on an observation bank that is both prompt-annotated and large enough to supply semantically related real clips. OpenVid-1M is one of the strongest current choices for this role because it provides over one million text-video pairs and a curated high-definition subset \citep{openvid2025}. For retrieval and prompt-alignment scoring we use LanguageBind, which places text, image, video, and depth features into a shared representation space \citep{languagebind2024}. For supervised token learning on fixed-length clips, MSR-VTT is a practical complementary benchmark because it provides 10K caption-annotated web videos and a widely used public train/test split \citep{xu2016msrvtt}.
-
-\paragraph{Data assimilation with learned and generative priors.}
-DA provides a principled answer to sequential state estimation under model error and partial observations. The broader DA literature has already argued that latent and reduced-order spaces are natural places to fuse machine learning with estimation \citep{buizza2022data}. More recent work combines DA with learned priors or generative models, including sparse-observation weather DA \citep{manshausen2024generative}, derivative-free ensemble guidance for diffusion models \citep{zheng2024ensemble}, stochastic-interpolant DA \citep{chen2025flowdas}, and diffusion or flow-based perspectives on posterior correction and sequential warm starts \citep{hodyss2025using, scholz2025warm, huang2026accelerated}. These papers show that DA-style correction remains useful even when the predictive prior is highly expressive. However, they are not focused on world models with retrieved visual memory, geometric observation operators, or long-horizon video drift. That gap is where our method sits.
-
-\paragraph{Geometry-aware observations.}
-To make retrieved evidence useful for state estimation, the observation should be structured rather than purely raw RGB. Monocular geometry estimators such as Depth Anything V2 \citep{yang2024depthanythingv2} offer a practical route: convert retrieved real clips into depth-aware observations that describe scene layout and coarse 3D consistency. In our setting, depth is not treated as full physical supervision; rather, it supplies a stable geometry summary that complements the anchor image and motion summaries when projecting retrieved videos into TI2V token space.
-
-\section{Preliminaries}
-
-\subsection{TI2V Continuation Setting}
-
-Let a supervised clip be a prompt-annotated 10-second video
+Classical DA provides the forecast--observation--analysis template used in this paper. The preliminary experiment instantiates this template with an ensemble transform Kalman filter (ETKF) \citep{bishop2001adaptive}. Let $\{x_i^{f}\}_{i=1}^{M}$ be an $M$-member forecast ensemble, with ensemble mean $\bar{x}^{f}$ and anomaly matrix
 \begin{equation}
-    x = (x_1,\dots,x_T), \qquad p \in \mathcal{P},
+    X'^{f} =
+    \begin{bmatrix}
+    x_1^{f}-\bar{x}^{f} & \cdots & x_M^{f}-\bar{x}^{f}
+    \end{bmatrix}.
 \end{equation}
-with midpoint split
+Given an observation $y$, an observation operator $H$, and observation covariance $R$, the corresponding forecast observations are $y_i^{f}=H(x_i^{f})$. Their mean and anomaly matrix are $\bar{y}^{f}$ and
 \begin{equation}
-    x^{\mathrm{ctx}} = x_{1:T/2}, \qquad x^{\mathrm{tgt}} = x_{T/2+1:T}.
+    Y'^{f} =
+    \begin{bmatrix}
+    y_1^{f}-\bar{y}^{f} & \cdots & y_M^{f}-\bar{y}^{f}
+    \end{bmatrix}.
 \end{equation}
-In Wan2.2 TI2V \citep{wan2026}, the later-half continuation is conditioned primarily on the last available image and the text prompt. We therefore define
+ETKF performs the analysis update in ensemble space:
+\begin{align}
+    S &= (M-1)I + (Y'^{f})^\top R^{-1}Y'^{f}, \\
+    w^{a} &= S^{-1}(Y'^{f})^\top R^{-1}(y-\bar{y}^{f}), \\
+    T^{a} &= \left[(M-1)S^{-1}\right]^{1/2}.
+\end{align}
+The analysis mean and analysis anomalies are then
 \begin{equation}
-    I_{\mathrm{last}} = x_{T/2},
+    \bar{x}^{a} = \bar{x}^{f} + X'^{f} w^{a},
+    \qquad
+    X'^{a} = X'^{f}T^{a}.
 \end{equation}
-and let the frozen TI2V context encoder produce the native continuation-conditioning token
+Thus the analysis ensemble is centered at a corrected state while preserving an updated ensemble spread. In the Moving MNIST preliminary study, $x_i$ is not an image directly; it is the latent recurrent state of the video predictor. This ETKF view is the controlled DA analogue of the retrieval-guided video setting: a forecast state is corrected by an observation trajectory before the next rollout step.
+
+\subsection{Preliminary Moving MNIST Study}
+
+Before evaluating retrieval-guided motion and physics consistency with a full image-to-video backbone, we include a controlled Moving MNIST study \citep{srivastava2015unsupervised} to isolate the DA interpretation itself. This experiment should be read as a partial result rather than as the final retrieval-guided Video-as-Prompt benchmark: it does not test OpenVid retrieval or Wan generation. Instead, it asks whether a learned dynamical predictor becomes smoother and more faithful when sparse observations are assimilated into the latent state of the same host predictor.
+
+The task uses the standard 10-to-10 Moving MNIST prediction setup. The first ten frames form the context. The open-loop method is a lightweight latent recurrent host, \texttt{OpenLoopVideoPredictor}, built from a residual convolutional encoder--decoder and a ConvLSTM-style transition module \citep{shi2015convlstm}. After encoding the context frames, the host rolls out future frames autoregressively: the recurrent state predicts a residual update to the previous latent frame, and the decoder maps each predicted latent back to image space. No future observations are used in this open-loop row.
+
+The open-loop+DA method uses the same host checkpoint and changes only the test-time state update. We form an ensemble by perturbing the host latent recurrent state $(z_t,h_t,c_t)$, propagate all ensemble members through the same forecast step, decode the forecast ensemble into observation space, and apply the latent ETKF update above whenever an observation is available. In the reported DA condition, the observation operator reveals the full held-out future frame every two future steps and adds Gaussian observation noise with standard deviation $0.02$, yielding five analysis updates per sequence. The analysis mean is decoded as the corrected prediction and is also fed forward as the state from which the next forecast starts.
+
+We report root mean squared error (RMSE) and pattern correlation coefficient (PCC). For predicted frames $\hat{x}$ and target frames $x$, RMSE is
 \begin{equation}
-    c^{0} = C_{\mathrm{wan}}(I_{\mathrm{last}}, p).
+    \mathrm{RMSE}(\hat{x},x) =
+    \sqrt{\frac{1}{|\Omega|}\sum_{u\in\Omega}(\hat{x}_u-x_u)^2},
 \end{equation}
-The target future clip is still encoded into latent space through the frozen Wan tokenizer or VAE:
+where $\Omega$ indexes all evaluated pixels across the predicted sequence. Lower RMSE indicates smaller pixel-level error. PCC measures frame-wise structural agreement after removing each frame mean:
 \begin{equation}
-    z^{\mathrm{tgt}} = E_{\mathrm{wan}}(x^{\mathrm{tgt}}).
+    \mathrm{PCC}(\hat{x},x) =
+    \frac{1}{T}\sum_{t=1}^{T}
+    \frac{\langle \hat{x}_t-\bar{\hat{x}}_t,\, x_t-\bar{x}_t\rangle}
+    {\|\hat{x}_t-\bar{\hat{x}}_t\|_2\|x_t-\bar{x}_t\|_2}.
 \end{equation}
-The token $c^{0}$ is the \emph{base conditioning token}: the native TI2V condition computed directly from the prompt and last context frame before any data-assimilation update. The latent $z^{\mathrm{tgt}}$ is the supervised target latent for the actual later half.
+Higher PCC indicates better agreement in the predicted spatial pattern.
+
+\begin{table}[H]
+    \centering
+    \caption{Preliminary Moving MNIST latent-DA result. All DA rows use the same host predictor as the open-loop row, with sparse full-frame observations every two future steps. Lower RMSE, higher PCC, and lower runtime ratio are better.}
+    \label{tab:mnist-da-prelim}
+    \begin{tabular}{lcccc}
+        \toprule
+        Method & RMSE $\downarrow$ & PCC $\uparrow$ & Observed steps & Runtime ratio \\
+        \midrule
+        Open-loop host & 0.1495 & 0.7593 & 0 & 1.00$\times$ \\
+        Host + latent ETKF (8 members) & 0.1410 & 0.7811 & 5 & 1.85$\times$ \\
+        Host + latent ETKF (100 members) & 0.1104 & 0.8375 & 5 & 11.97$\times$ \\
+        Host + latent ETKF (500 members) & 0.0898 & 0.8915 & 5 & 40.36$\times$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{assets/etkf_ensemble_sweep_metrics.png}
+    \caption{Previously run Moving MNIST latent-ETKF ensemble-size sweep. The RMSE panel shows that larger ensembles improve the ETKF analysis quality, while the runtime panel shows the rapidly increasing cost of explicit ensemble assimilation.}
+    \label{fig:etkf-ensemble-sweep}
+\end{figure}
+
+Table~\ref{tab:mnist-da-prelim} shows that latent ETKF improves the same host predictor as the ensemble size grows. The 8-member update gives a small but consistent gain, reducing RMSE from 0.1495 to 0.1410 and improving PCC from 0.7593 to 0.7811. The 100-member and 500-member runs strengthen the correction further, reaching RMSE 0.1104/PCC 0.8375 and RMSE 0.0898/PCC 0.8915, respectively. Figure~\ref{fig:etkf-ensemble-sweep} shows the same trend in the previous ensemble-size sweep up to 200 members. The result is useful for this paper because it demonstrates the same conceptual decomposition used by the retrieval-guided inference pipeline for motion quality: a forecast state, an observation operator, an innovation, and an analysis update.
+
+This controlled result also clarifies the expected tradeoff. Stronger explicit ETKF correction requires larger ensembles, and runtime grows from 1.85$\times$ at 8 members to 11.97$\times$ at 100 members and 40.36$\times$ at 500 members. This runtime scaling motivates using the existing in-context attention pathway to approximate the ETKF analysis process inside the generator rather than explicitly sampling and updating hundreds of trajectories. In the video setting, forecast tokens can play the role of the forecast state, retrieved real-video tokens can play the role of observations, and in-context attention can approximate the analysis update in a single denoising pathway. Thus, the preliminary study motivates the Video-as-Prompt inference version of the method: the retrieved video should act as the observation trajectory inside the DiT in-context pathway for smoother, more physically plausible motion.
+
+\section{Method}
+
+\subsection{Overview}
+
+The method uses Video-as-Prompt-style inference \citep{bian2025videoasprompt} as the host image-to-video system and interprets its existing in-context pathway as an attention-based approximation to a DA analysis update. The base image-to-video branch is the forecast stream. The retrieved reference-video branch is the observation stream. The existing in-context DiT pathway allows these streams to interact without explicitly sampling a large ETKF ensemble. The pipeline is organized into four steps:
+\begin{enumerate}[leftmargin=1.2em]
+    \item retrieve one real trajectory from the shared LanguageBind world memory;
+    \item encode the selected trajectory as observation tokens $O$;
+    \item run Video-as-Prompt inference with noisy forecast tokens $H^{f}$ and observation tokens $H^{o}$;
+    \item interpret the forecast-side in-context output as analysis tokens before noise prediction.
+\end{enumerate}
+Figure~\ref{fig:architecture} summarizes the retrieval and DiT inference architecture.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{assets/retrieval_vap_architecture_imagegen.png}
+    \caption{Architecture of the retrieval-guided Video-as-Prompt inference pipeline. The input image and text prompt form a LanguageBind query over an OpenVid-1M retrieval bank. The top-1 retrieved real clip is encoded as observation tokens, while the base image-to-video branch supplies noisy forecast tokens. Inside the Video-as-Prompt DiT denoiser, forecast tokens attend to retrieved observation tokens; the forecast-side analysis tokens are then used for noise prediction and video generation.}
+    \label{fig:architecture}
+\end{figure}
 
 \subsection{Retrieval Memory and Shared Embedding Space}
 
@@ -112,230 +169,216 @@ We assume a retrieval bank
 \begin{equation}
     \mathcal{R} = \{(r_i, c_i)\}_{i=1}^{N},
 \end{equation}
-where $r_i$ is a real video clip and $c_i$ is its caption. A LanguageBind encoder \citep{languagebind2024} maps text, image, and video inputs into a shared embedding space. Given the prompt and the last context frame, we build the retrieval query
+where $r_i$ is a real video trajectory and $c_i$ is its caption. A LanguageBind encoder \citep{languagebind2024} maps text, image, and video inputs into a shared embedding space. Given a prompt $p$ and an anchor image $I$, we build the retrieval query
 \begin{equation}
-    q = Q_{\mathrm{LB}}(p, I_{\mathrm{last}}),
+    q = Q_{\mathrm{LB}}(p, I),
 \end{equation}
-retrieve the top-$K$ clips, and compute normalized weights
+and retrieve the single nearest clip
 \begin{equation}
-    \alpha_k = \frac{\exp(s(q,r_k)/\tau)}{\sum_{j=1}^{K}\exp(s(q,r_j)/\tau)}.
+    (r^{\star}, c^{\star}) = \arg\max_{(r_i,c_i)\in \mathcal{R}} s(q,r_i).
 \end{equation}
+This retrieval memory defines the external observation source. The retrieved clip is not a label and not a target future. It is an empirical trajectory from world memory: one example of how a semantically related scene evolves in real video.
 
-\subsection{Observation Summaries}
+\subsection{Video World Model Setting}
 
-The retrieved observation is a video, but the TI2V conditioning space is centered on image-plus-text inputs. To bridge that mismatch, we summarize each retrieved clip with three components:
-\begin{enumerate}[leftmargin=1.2em]
-    \item an \emph{anchor-image observation} for appearance and scene identity,
-    \item a \emph{depth observation} for geometry,
-    \item a \emph{motion observation} for temporal evolution.
-\end{enumerate}
-
-Let $\Psi(\cdot)$ be a frozen depth extractor such as Depth Anything V2, and let $\Phi(\cdot)$ be a frozen motion extractor such as dense optical flow. These operators define the observation space that will later be compared with the base conditioning token.
-
-\section{Method}
-
-\subsection{Overview}
-
-Our method trains exactly one new module: a \emph{data-assimilated tokenizer} or \emph{gain network} $G_{\phi}$. Everything else remains frozen, including Wan2.2 TI2V, LanguageBind, Depth Anything V2, and the retrieval index. The method is organized into four steps:
-\begin{enumerate}[leftmargin=1.2em]
-    \item obtain the native TI2V conditioning token from the prompt and context image;
-    \item retrieve top-$K$ real clips and project them into a shared observation summary;
-    \item compute the innovation between the conditioning-side summary and the observation summary;
-    \item predict a token correction that turns the native conditioning token into a data-assimilated continuation token.
-\end{enumerate}
-
-\subsection{Base Conditioning Token from the Frozen TI2V Prior}
-
-Although the supervised training clip provides the full first-half context, the frozen TI2V model only receives the same conditioning interface it will see at inference time: the last context frame and the text prompt. Let
+Let an image-to-video world-model input be an anchor observation and a task descriptor
 \begin{equation}
-    c^{0} = C_{\mathrm{wan}}(I_{\mathrm{last}}, p)
+    I \in \mathcal{I}, \qquad p \in \mathcal{P}.
 \end{equation}
-be the native conditioning token generated by the frozen Wan2.2 TI2V prompt-and-image pathway. Importantly, $c^{0}$ is \emph{not} obtained by first generating a future clip and then re-encoding that clip. It is the DiT input condition itself, before any data-assimilation correction is applied.
-
-\subsection{Projecting Retrieved Videos into TI2V Observation Space}
-
-The retrieved observation is a video with nontrivial temporal structure, while TI2V expects image-centered conditioning. We therefore summarize each retrieved clip $r_k$ into an anchor-image token, a depth token, and a motion token.
-
-We first choose the anchor frame
+The model samples a latent trajectory and decodes it as a video
 \begin{equation}
-    \tilde{I}_k = r_{k,u^\star},
-    \qquad
-    u^\star = \arg\max_{u}\cos\!\big(E_{\mathrm{img}}(r_{k,u}), E_{\mathrm{img}}(I_{\mathrm{last}})\big),
+    \hat{x} = (\hat{x}_1,\dots,\hat{x}_T)
 \end{equation}
-which selects the retrieved frame most compatible with the current context boundary.
-
-We then define the per-clip observation summary
+from a noisy latent state $z_t^{p}$, the prompt $p$, and the anchor image $I$. Here, $z_t^{p}$ is the native DiT latent state at denoising time $t$, and the superscript $p$ denotes the prompt/image-conditioned prior rollout before any retrieved-video observation is used. We define the corresponding DA forecast state as
 \begin{equation}
-    y_k^{o}
+    z_t^{f} \equiv z_t^{p}.
+\end{equation}
+The superscript $f$ denotes the forecast state: before assimilation, the world-model forecast is exactly the base DiT latent generated from $(I,p)$.
+The retrieved real-video clip is an observation of plausible motion and physical evolution for a semantically related scene. The goal is not to reconstruct a specific target clip, but to produce an analysis trajectory $z_t^{a}$ whose decoded video is more stable, smoother, and more physically faithful than the unassimilated forecast.
+
+In world-model terms, retrieval-guided inference is a latent state-estimation problem with an external memory. The base DiT defines a transition forecast from $(I,p)$ to a noisy latent trajectory. Retrieval provides a single empirical observation trajectory $O$ showing how a similar state evolves. The desired update is an analysis operator
+\begin{equation}
+    z_t^{a} = \mathcal{A}_{\theta}(z_t^{f}, O, p, I),
+\end{equation}
+where $z_t^{a}$ is the analysis latent state after incorporating the retrieved observation at denoising step $t$; $\mathcal{A}_{\theta}$ is the analysis operator induced by the Video-as-Prompt in-context DiT pathway with parameters $\theta$; $z_t^{f}$ is the forecast latent state from the base image-to-video DiT before observation use; $O$ is the single retrieved real-video observation-token sequence; $p$ is the text prompt; and $I$ is the input anchor image. The analysis state should preserve the semantic intent of the prompt while improving temporal coherence and physical plausibility.
+
+\subsection{Observation Tokens}
+
+The retrieved video trajectory is converted into one token sequence rather than a single summary vector or a multi-sample set. Let $E_{\mathrm{vid}}$ denote the frozen video preprocessing, VAE encoding, and patch embedding path that maps the retrieved clip into DiT-compatible spatio-temporal tokens. For the most similar retrieved clip, we write the observation token as:
+\begin{equation}
+    O = E_{\mathrm{vid}}(r^{\star}, c^{\star}),
+\end{equation}
+where the caption $c^{\star}$ supplies text-side observation context. We do not concatenate multiple retrieved clips or use retrieval weights as attention biases in this first version.
+The key point is that the retrieved video enters the DiT as observation data for the world state, rather than as an external score or auxiliary label.
+
+\subsection{Forecast and Observation Streams}
+
+At denoising step $t$, the base DiT receives a noisy latent video $z_t^{f}$ together with prompt and image conditioning. After patch embedding, this produces forecast tokens
+\begin{equation}
+    H_0^{f} = P_{\mathrm{patch}}(z_t^{f}, I, p).
+\end{equation}
+The retrieved video branch receives the observation tokens $O$ and optional observation text/image embeddings, giving
+\begin{equation}
+    H_0^{o} = P_{\mathrm{obs}}(O).
+\end{equation}
+The forecast stream is the internal world-model rollout. The observation stream is a real-video branch. Both streams are propagated through the DiT, but only the forecast-side analysis output is used to predict the noise for the generated video.
+
+\subsection{Data-Assimilation View of In-Context Attention}
+
+For a selected DiT block $\ell$, let $H_{\ell}^{f}$ denote forecast tokens and $H_{\ell}^{o}$ denote observation tokens. In the Video-as-Prompt-style in-context pathway, the generated-video branch and reference-video branch can be written with separate QKV projections:
+\begin{equation}
+    Q_{\ell}^{f},K_{\ell}^{f},V_{\ell}^{f}
     =
-    \operatorname{concat}\!\Big(
-    E_{\mathrm{img}}(\tilde{I}_k),
-    E_{\mathrm{depth}}(\Psi(r_k)),
-    E_{\mathrm{mot}}(\Phi(r_k))
-    \Big),
-\end{equation}
-where $E_{\mathrm{img}}$, $E_{\mathrm{depth}}$, and $E_{\mathrm{mot}}$ are frozen summary encoders on top of LanguageBind image features, depth features, and motion features respectively. The retrieved observation is the weighted average
-\begin{equation}
-    y^{o} = \sum_{k=1}^{K}\alpha_k\,y_k^{o}.
-\end{equation}
-
-The native TI2V conditioning token is projected into the same space through a frozen summary operator
-\begin{equation}
-    y^{0} = H(c^{0}).
-\end{equation}
-The resulting innovation is
-\begin{equation}
-    r = y^{o} - y^{0}.
-\end{equation}
-This is the key DA quantity: it measures how the retrieved observation disagrees with the native TI2V condition in a common observation space even though the original modalities differ.
-
-\subsection{Data-Assimilated Tokenizer}
-
-Let
-\begin{equation}
-    e_p = E_{\mathrm{text}}(p), \qquad e_I = E_{\mathrm{img}}(I_{\mathrm{last}})
-\end{equation}
-denote the prompt embedding and the last-frame embedding. The only trainable module is the gain network
-\begin{equation}
-    \Delta c = G_{\phi}\!\big(\operatorname{concat}(c^{0}, y^{0}, y^{o}, r, e_p, e_I)\big),
-\end{equation}
-which predicts a token correction with the same dimensionality as the conditioning token. The final data-assimilated token is
-\begin{equation}
-    c^{a} = c^{0} + \Delta c.
-    \label{eq:data-assimilated-token}
-\end{equation}
-At inference time, $c^{a}$ replaces $c^{0}$ as the later-half continuation condition that is fed into the frozen Wan DiT tail for second-half generation.
-
-\subsection{Training Objective}
-
-Because the gain network modifies the DiT input condition rather than directly predicting a target video token, the natural objective is the frozen Wan diffusion likelihood on the ground-truth later half. Let
-\begin{equation}
-    z_t^{\mathrm{noisy}} = \alpha_t z^{\mathrm{tgt}} + \sigma_t \epsilon,
+    W_{qkv}^{f} H_{\ell}^{f},
     \qquad
-    \epsilon \sim \mathcal{N}(0, I),
-\end{equation}
-denote the standard noised target latent used by the frozen Wan diffusion objective. The gain network is trained through the frozen denoiser
-\begin{equation}
-    \hat{\epsilon} = \epsilon_{\theta}\!\big(z_t^{\mathrm{noisy}}, t \mid c^{a}\big),
-\end{equation}
-and optimized with the usual denoising surrogate
-\begin{equation}
-    \mathcal{L}_{\mathrm{diff}}
+    Q_{\ell}^{o},K_{\ell}^{o},V_{\ell}^{o}
     =
-    \mathbb{E}_{t,\epsilon}
-    \left[
-    \|\hat{\epsilon} - \epsilon\|_2^2
-    \right].
-    \label{eq:token-loss}
+    W_{qkv}^{o} H_{\ell}^{o}.
 \end{equation}
-Only the gain network parameters $\phi$ are updated; the Wan backbone parameters $\theta$ remain frozen. In the first implementation, this is the only training loss. We do not add an adversarial discriminator or a separate perceptual objective. The goal is to isolate whether the gain network can learn a useful conditioning-space analysis update by itself.
-
-\section{Derivations}
-
-The conditioning-space DA update in Eq.~\eqref{eq:data-assimilated-token} can be read as a nonlinear Kalman-style analysis step. In our TI2V setting, the DA prior is the native conditioning token itself rather than a separately predicted video. If the base conditioning token $c^{0}$ plays the role of a prior state and the observation summary $y^{o}$ defines a noisy measurement, then a classical linear DA update would take the form
+The in-context full-attention form is
 \begin{equation}
-    c^{a} = c^{0} + K r,
+    \begin{bmatrix}
+    \bar{H}_{\ell}^{f}\\
+    \bar{H}_{\ell}^{o}
+    \end{bmatrix}
+    =
+    \operatorname{Attn}\!\left(
+    \begin{bmatrix}Q_{\ell}^{f}\\Q_{\ell}^{o}\end{bmatrix},
+    \begin{bmatrix}K_{\ell}^{f}\\K_{\ell}^{o}\end{bmatrix},
+    \begin{bmatrix}V_{\ell}^{f}\\V_{\ell}^{o}\end{bmatrix}
+    \right),
+    \label{eq:full-da-attn}
 \end{equation}
-for some gain matrix $K$. Our gain network simply replaces the fixed linear gain with a learned nonlinear map:
+where $\operatorname{Attn}(Q,K,V)=\operatorname{softmax}(QK^\top/\sqrt{d})V$. For a lighter cross-attention implementation, the forecast stream can query both streams while the observation stream is left fixed:
 \begin{equation}
-    K r \;\;\leadsto\;\; G_{\phi}\!\big(\operatorname{concat}(c^{0}, y^{0}, y^{o}, r, e_p, e_I)\big).
+    \bar{H}_{\ell}^{f}
+    =
+    \operatorname{Attn}\!\left(
+    Q_{\ell}^{f},
+    \begin{bmatrix}K_{\ell}^{f}\\K_{\ell}^{o}\end{bmatrix},
+    \begin{bmatrix}V_{\ell}^{f}\\V_{\ell}^{o}\end{bmatrix}
+    \right).
+    \label{eq:cross-da-attn}
 \end{equation}
-This preserves the prior--innovation--analysis structure while allowing the correction to depend on prompt semantics, anchor-image content, and observation quality.
+In both cases, the forecast-side output $\bar{H}_{\ell}^{f}$ is the analysis representation. The cross terms between $Q_{\ell}^{f}$ and $K_{\ell}^{o}$ measure which observation tokens are relevant to the current generated latent forecast. We interpret these weights as an in-context score for motion smoothness and physical compatibility.
 
-Under the frozen diffusion model in Eq.~\eqref{eq:token-loss}, the gain network is optimized entirely through the later-half denoising objective of the frozen TI2V backbone. The current training plan therefore asks a direct question: can a single gain network learn a useful conditioning-space analysis operator while the TI2V backbone remains completely frozen?
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{assets/da_vs_incontext_attention_chatgpt.png}
+    \caption{Conceptual comparison between explicit classical DA and in-context attention. Classical DA, shown on the left, performs an explicit ensemble update: many sampled forecast trajectories are corrected by an observation to produce an analysis ensemble. In-context attention, shown on the right, replaces explicit ensemble propagation with a single token pathway: generated forecast tokens attend to retrieved observation tokens and produce updated analysis tokens inside the DiT.}
+    \label{fig:da-vs-incontext-attention}
+\end{figure}
 
-\section{Experiments and Training Plan}
+\subsection{Noise Prediction with Observation Tokens}
 
-\subsection{Datasets}
+After the in-context interaction, the DiT predicts the noise using the updated forecast stream:
+\begin{equation}
+    \hat{\epsilon}
+    =
+    \epsilon_{\theta}\!\left(
+    z_t^{f}, t, p, I, O
+    \right).
+\end{equation}
+The observation tokens are therefore part of the DiT world-model input. They do not produce a separate output video; they influence the generated trajectory by modifying the forecast stream during attention.
 
-\paragraph{Retrieval bank.}
-We use OpenVid-1M as the external observation memory \citep{openvid2025}. Each entry provides a caption and a real video clip, making it suitable for prompt-conditioned retrieval. In the implementation phase, we download a storage-bounded subset of the public Hugging Face mirror \texttt{lodestones/OpenVid-1M} and build the retrieval index only from this corpus; the retrieval bank is never used as a supervised target.
+\section{Experiment}
 
-\paragraph{Supervised train/validation/test set.}
-We use MSR-VTT as the supervised continuation dataset \citep{xu2016msrvtt}. MSR-VTT contains 10K caption-annotated web videos with a standard 9K/1K train/test split. For implementation convenience, we download the public Hugging Face mirror \texttt{VLM2Vec/MSR-VTT}. We reserve 1K clips from the 9K training portion for validation and use the remaining 8K clips for training. Since MSR-VTT clip durations vary, we extract a canonical 10-second window per clip before splitting it into a 5-second context half and a 5-second target half.
+\paragraph{Retrieval bank and algorithm.}
+OpenVid-1M serves as the external observation memory \citep{openvid2025}. We retrieve the top-1 real clip by ranking cached LanguageBind caption/video embeddings against the input prompt and anchor image.
+\paragraph{Inference with retrieved video.}
+We compare a Wan2.1-14B baseline, conditioned only on the input image and prompt, with our Video-as-Prompt path \citep{bian2025videoasprompt}, which uses the same image as the VAP reference image and the retrieved clip as the VAP reference video. Both paths generate 17 frames; the comparison tests whether the retrieved observation improves motion smoothness, physical consistency, and scene-level dynamics relative to the baseline.
 
-\paragraph{Data separation.}
-The retrieval bank and the supervised continuation dataset are disjoint by construction: OpenVid-1M is used only for retrieval, while MSR-VTT is used only for supervised training and evaluation. This avoids label leakage from the observation bank into the target continuation clips.
+\section{Qualitative Experiment}
 
-\subsection{Preprocessing and Cached Features}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{assets/qualitative_temporal_panel_1.png}
+    \caption{Temporal-sample qualitative comparison for cases 1--2. The exact text prompt is printed above each case. For each retrieved, Wan2.1-14B, or ours sequence, 16 temporally ordered samples are split into two rows of eight frames, $t_1$--$t_8$ and $t_9$--$t_{16}$.}
+    \label{fig:qualitative-temporal-a}
+\end{figure}
 
-All supervised clips are resampled to a fixed frame rate and resolution supported by the frozen Wan TI2V pipeline. For each MSR-VTT clip we store:
-\begin{enumerate}[leftmargin=1.2em]
-    \item the first-half context clip $x^{\mathrm{ctx}}$,
-    \item the last context frame $I_{\mathrm{last}}$,
-    \item the ground-truth second-half target clip $x^{\mathrm{tgt}}$,
-    \item the native TI2V conditioning token $c^{0} = C_{\mathrm{wan}}(I_{\mathrm{last}}, p)$,
-    \item the Wan target latent $z^{\mathrm{tgt}} = E_{\mathrm{wan}}(x^{\mathrm{tgt}})$.
-\end{enumerate}
+\paragraph{Protocol.}
+We run a first qualitative pilot on six manually supplied image--video pairs. Each folder name is converted into the prompt by replacing underscores with spaces. The figure panels serve as part of the experiment description: each case prints its exact prompt above the retrieved reference video, Wan2.1-14B baseline, and our retrieved-video generation. For each case, the Wan2.1-14B baseline receives only the input image and text prompt. The retrieval-guided run receives the same image and prompt, plus the corresponding reference video as the retrieved observation supplied to Video-as-Prompt inference. All runs use a single seed and generate 17 frames. We use Wan2.1-14B for the baseline test, matching the base family used by the retrieved-video Video-as-Prompt path. Therefore this is a diagnostic pilot rather than a full benchmark. Figures~\ref{fig:qualitative-temporal-a}--\ref{fig:qualitative-temporal-c} show 16 temporally ordered samples spanning each available video. For each retrieved, Wan2.1-14B, or ours sequence, the samples are arranged as two rows of eight frames: $t_1$--$t_8$ and $t_9$--$t_{16}$. These labels denote normalized temporal sample positions, not consecutive frame indices. The retrieved rows are sampled from the full reference video used by Video-as-Prompt, while the Wan2.1-14B and ours rows are sampled across the generated 17-frame clips.
 
-For the OpenVid retrieval bank we precompute and cache:
-\begin{enumerate}[leftmargin=1.2em]
-    \item LanguageBind text and video embeddings,
-    \item depth summaries from Depth Anything V2,
-    \item motion summaries from a frozen flow extractor,
-    \item metadata needed to recover the original clip path and frames.
-\end{enumerate}
-This makes the online training loop lightweight: Wan TI2V is used only to encode the native continuation condition and evaluate the frozen denoising objective, retrieval is performed over cached embeddings, and only the gain network is updated.
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{assets/qualitative_temporal_panel_2.png}
+    \caption{Temporal-sample qualitative comparison for cases 3--4. The retrieved rows show the real-video observation supplied to Video-as-Prompt, and the generated rows show Wan2.1-14B baseline inference and our retrieved-video inference at the same 16 normalized temporal positions.}
+    \label{fig:qualitative-temporal-b}
+\end{figure}
 
-\subsection{Training Procedure}
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\linewidth]{assets/qualitative_temporal_panel_3.png}
+    \caption{Temporal-sample qualitative comparison for cases 5--6. The two-row temporal layout makes scene-level motion visible while keeping each frame large enough to inspect.}
+    \label{fig:qualitative-temporal-c}
+\end{figure}
 
-The training procedure follows the exact prior--analysis structure in the method section.
-\begin{enumerate}[leftmargin=1.2em]
-    \item Freeze Wan2.2 TI2V, LanguageBind, Depth Anything V2, and the motion extractor.
-    \item For each MSR-VTT training clip, keep only the last frame of the first half and the prompt as TI2V input.
-    \item Use the frozen Wan prompt-and-image encoder path to build the native conditioning token $c^{0}$.
-    \item Build a LanguageBind retrieval query from the prompt and the last context frame.
-    \item Retrieve the top-$K$ OpenVid clips and compute the weighted observation summary $y^{o}$.
-    \item Compute the conditioning-side summary $y^{0}$ and innovation $r = y^{o} - y^{0}$.
-    \item Run the gain network to obtain the assimilated conditioning token $c^{a}$.
-    \item Optimize only the frozen Wan denoising loss in Eq.~\eqref{eq:token-loss}.
-\end{enumerate}
+\begin{table}[H]
+    \centering
+    \footnotesize
+    \setlength{\tabcolsep}{3pt}
+    \caption{Qualitative observations from the six-case pilot. These are visual notes from side-by-side videos, not benchmark scores.}
+    \label{tab:qualitative-six-case}
+    \begin{tabular}{p{0.23\linewidth}p{0.33\linewidth}p{0.36\linewidth}}
+        \toprule
+        Case & Wan2.1-14B baseline & Ours + retrieved video observation \\
+        \midrule
+        Basketball & Preserves the court and player cleanly, but most motion is local and the background remains nearly fixed. & Adds a clearer shooting-and-follow-through trajectory, with stronger body displacement; some appearance and layout drift appear. \\
+        Swing & Keeps the child's face, ropes, and background stable, with only modest forward motion. & Produces stronger swing-like camera motion and depth change, but becomes close-up, blurry, and less identity-preserving. \\
+        Dog & The dog remains mostly stationary, so the result is visually stable but weakly dynamic. & Introduces body turning and approach motion in the water, with stronger temporal change but softer details. \\
+        Horse & Maintains horse and rider detail with a plausible gallop pose, but motion is relatively conservative. & Injects stronger lateral tracking and scene motion; the motion is more energetic but overshoots the frame by the late step. \\
+        Surfing & Keeps the wave scene readable and stable, with moderate motion. & Increases board, wave, and camera motion, making the clip more dynamic while adding blur and subject drift. \\
+        Running & Moves the foreground runner while much of the road and crowd remain static. & Produces stronger forward running and global scene motion; the road and distant runners evolve more visibly, with mild blur. \\
+        \bottomrule
+    \end{tabular}
+\end{table}
 
-In the first implementation, we use AdamW with a single learning rate for $G_{\phi}$, mixed precision, and early stopping on MSR-VTT validation denoising loss. Because only one small network is trained, this loop is substantially cheaper than fine-tuning the full Wan prior.
-
-\subsection{Planned Evaluation}
-
-The primary training metric is the frozen Wan denoising loss on the MSR-VTT validation set. We also plan to decode the assimilated continuation with the frozen Wan decoder and report three secondary continuation metrics:
-\begin{enumerate}[leftmargin=1.2em]
-    \item later-half reconstruction quality against the ground-truth target half,
-    \item depth residual between decoded continuation and target continuation,
-    \item transition smoothness between the last context frame and the first frames of the generated second half.
-\end{enumerate}
-For the first project milestone, we prioritize a small number of qualitative case studies to verify that the data-assimilated token changes the later-half rollout in a meaningful way before scaling to a larger benchmark sweep.
-
-\subsection{Training Loop Pseudocode}
-
-\begin{quote}
-\small
-\ttfamily
-for each minibatch $(p, x^{ctx}, x^{tgt})$ from $D^{train}_{sup}$ do\\
-\hspace*{1em}$I_{last} \leftarrow \text{last\_frame}(x^{ctx})$\\
-\hspace*{1em}$c^{0} \leftarrow C_{wan}(I_{last}, p)$ \quad // frozen Wan2.2 TI2V base condition\\
-\hspace*{1em}$z^{tgt} \leftarrow E_{wan}(x^{tgt})$\\
-\hspace*{1em}$q \leftarrow Q_{LB}(p, I_{last})$\\
-\hspace*{1em}$\{(r_k,\alpha_k)\}_{k=1}^{K} \leftarrow \text{Retrieve}(\mathcal{R}, q)$\\
-\hspace*{1em}$y^{o} \leftarrow \sum_{k=1}^{K}\alpha_k \cdot \text{ObsSummary}(r_k)$\\
-\hspace*{1em}$y^{0} \leftarrow H(c^{0})$\\
-\hspace*{1em}$r \leftarrow y^{o} - y^{0}$\\
-\hspace*{1em}$\Delta c \leftarrow G_{\phi}(\operatorname{concat}(c^{0}, y^{0}, y^{o}, r, E_{text}(p), E_{img}(I_{last})))$\\
-\hspace*{1em}$c^{a} \leftarrow c^{0} + \Delta c$\\
-\hspace*{1em}sample diffusion step $t$ and noise $\epsilon$\\
-\hspace*{1em}$z_t^{noisy} \leftarrow \alpha_t z^{tgt} + \sigma_t \epsilon$\\
-\hspace*{1em}$\hat{\epsilon} \leftarrow \epsilon_{\theta}(z_t^{noisy}, t \mid c^{a})$\\
-\hspace*{1em}$\mathcal{L} \leftarrow \|\hat{\epsilon} - \epsilon\|_2^2$\\
-\hspace*{1em}update $\phi$ with AdamW; keep all other modules frozen\\
-end for
-\end{quote}
+\paragraph{Analysis.}
+Across the six cases, the retrieved-video observation most clearly helps when the prompt requires scene-level motion rather than only local texture change. Running, surfing, dog fetching, and basketball show the intended behavior: the observation path pushes the generated clip toward a more dynamic trajectory. This is consistent with the DA interpretation, because the retrieved video acts as an external motion observation that changes the forecast trajectory rather than only decorating the first frame. The negative side is equally important. The retrieved-video path sometimes sacrifices spatial fidelity, especially for the swing and horse examples, where the model introduces strong motion but loses framing or sharpness. The average runtime in this pilot is also higher: about 244 seconds for Wan2.1-14B baseline inference and about 810 seconds for the retrieved-video path, roughly a 3.3$\times$ increase in this implementation. The result should therefore be read as a proof-of-concept signal for observation-aware dynamics, not as a final performance claim.
 
 \section{Discussion}
 
-The main benefit of the revised formulation is cleanliness: one frozen TI2V prior, one retrieval bank, one observation projection, and one trainable gain network. The main risk is also clear: the projection from retrieved-video space into TI2V token space may discard temporal detail that would have been useful for continuation. This makes the anchor-image selection, depth summary, and motion summary the most important design choices in the whole pipeline. If the projected observation is poor, the innovation signal will be noisy even when retrieval itself is semantically correct.
+The main benefit of the revised formulation is cleanliness: one video world-model prior, one retrieval memory, and one Video-as-Prompt inference path that treats the retrieved clip as observation evidence. The six-case qualitative pilot gives a first sanity check for this story: when the retrieved clip contains a useful trajectory, the generated video tends to exhibit more scene-level motion than the image-to-video baseline. At the same time, the pilot makes the core limitation visible. Observation-aware motion is not automatically observation-faithful motion; too much retrieved-video influence can produce blur, subject drift, or framing changes that weaken spatial consistency.
 
-Another limitation is that the current formulation still leaves the observation-to-condition projection implicit through the frozen summary operator $H$ and the gain network. This is intentional for the first implementation because the paper aims to test whether conditioning-space DA is useful before adding more complicated architectural structure.
+Figure~\ref{fig:da-vs-incontext-attention} summarizes the reason for using the existing in-context attention update rather than explicit ETKF at video-generation scale. The Moving MNIST study shows that larger ETKF ensembles improve RMSE and PCC, but the runtime ratio grows rapidly. A DiT generator cannot practically sample and update hundreds of full video trajectories at each denoising step. In-context attention is therefore not only a modeling choice, but also a computational approximation to the forecast--observation--analysis update: it lets forecast tokens interact with observation tokens inside one denoising pass.
+
+The main risk is also clear: the observation path must preserve temporal detail that is useful for judging motion smoothness and physics consistency. If the retrieved clip is semantically related but dynamically mismatched, the attention scores may still inject weak or distracting motion evidence.
+
+Another limitation is that the current formulation treats attention weights as a model-internal compatibility score, but these weights are not automatically calibrated probabilities. They should be evaluated empirically through motion smoothness, physical consistency, and retrieval relevance before being interpreted as a faithful uncertainty estimate. The current qualitative comparison is still small, single-seed, and manually curated, so it should be interpreted as a pilot study rather than a clean benchmark. Its value is narrower: it shows the practical behavior of using a retrieved video as an observation in the available inference system.
+
+\section{Related Work}
+
+\paragraph{Trinity consistency for world models.}
+\citet{trinityconsistency2026} argue that a general world model should be defined through modal, spatial, and temporal consistency. We adopt this trinity as the conceptual frame for the paper. Modal consistency connects prompts and visual observations to a shared semantic state. Spatial consistency preserves geometry, identity, and layout across frames and viewpoints. Temporal consistency governs causal evolution and motion. Our DA framing focuses on the intersection of spatial and temporal consistency: a retrieved real-video trajectory is treated as an observation that can stabilize the DiT forecast state.
+
+\paragraph{Video generation as world modeling.}
+Latent world models compress observations into a state representation and then evolve that representation forward with a learned dynamics model. This design underlies both classical latent control architectures and modern generative world models. \citet{ha2018world} made the paradigm explicit by separating representation, memory, and control, while recent surveys argue that modern video generators are increasingly being interpreted through a world-model lens \citep{videoworldmodelsreview2026, mechanisticview2026}. Under this lens, an image-to-video DiT is not only a renderer but also a latent transition model: it predicts how a scene state should evolve under a prompt, intent, or task description.
+
+\paragraph{Spatial consistency and geometry-aware memory.}
+A growing body of work attacks spatial inconsistency directly. World-consistent Video Diffusion uses explicit 3D coordinate frames to supervise 3D-consistent generation \citep{worldconsistentdiffusion2024}. GEN3C conditions generation on a 3D cache to improve world-consistent video generation with precise camera control \citep{gen3c2025}. Video world models with long-term spatial memory store and retrieve geometry-grounded memory to prevent scene forgetting during revisits \citep{spatialmemory2025}. Other memory-based systems, including WorldPack and EvoWorld, improve spatial consistency through compressed or explicit memory mechanisms \citep{worldpack2025, evoworld2025}. These works motivate our use of one retrieved real-video trajectory as a spatial-temporal observation source.
+
+\paragraph{State drift, memory, and physical plausibility.}
+A related 2025--2026 line of work attacks temporal drift, weak state persistence, and physically implausible dynamics by strengthening memory, context, or closed-loop interaction. Examples include retrieval- or state-conditioned video world models \citep{chen2025interactiveworldmodels, icworld2025}, embodied rollouts with mixture-of-experts or closed-loop training \citep{longscape2025, worldinworld2025}, and persistent or embodiment-aware latent states \citep{persistentworld2025, bridgev2w2026}. These works demonstrate that better state representations and memory mechanisms are critical, but they still largely handle external evidence through conditioning, retrieval augmentation, or latent persistence rather than through an explicit forecast--observation--analysis update inside the transition model.
+
+\paragraph{Retrieval as external world memory.}
+Retrieval and external memory have become common tools for improving video realism and long-horizon coherence. Retrieval-augmented generation appears in systems such as \citet{ragme2025} and \citet{chen2025interactiveworldmodels}, while explicit memory banks or persistent scene stores are central to \citet{worldpack2025}, \citet{evoworld2025}, and \citet{icworld2025}. In most of these methods, retrieved evidence is used as conditioning context, as a state prompt, or as an auxiliary memory. Our formulation is deliberately narrower and more explicit: retrieved evidence is treated as an observation of real-world dynamics. The retrieval memory is therefore an empirical world-memory bank, and the DiT must assimilate this observation into its latent forecast rather than merely append it as context.
+
+\paragraph{Multimodal retrieval support.}
+The formulation depends on an observation bank that is both prompt-annotated and large enough to supply semantically related real clips. OpenVid-1M is one practical choice for this role because it provides over one million text-video pairs and a curated high-definition subset \citep{openvid2025}. For retrieval and prompt-alignment scoring we use LanguageBind, which places text, image, and video features into a shared representation space \citep{languagebind2024}.
+
+\paragraph{Video-as-prompt control.}
+Video-as-Prompt (VAP) frames semantic-controlled video generation as in-context generation: a reference video provides the desired semantics, and a reference image provides the visual anchor \citep{bian2025videoasprompt}. We use this inference structure directly: the retrieved OpenVid clip becomes the reference video, and the input image remains the reference image. Our contribution is not a new attention mechanism; it is the DA interpretation and retrieval wrapper that treats the reference video as an observation trajectory from world memory and reads the forecast-to-observation token interaction as an analysis update for the DiT transition state.
+
+\paragraph{Data assimilation with learned and generative priors.}
+DA provides a principled answer to sequential state estimation under model error and partial observations. The broader DA literature has already argued that latent and reduced-order spaces are natural places to fuse machine learning with estimation \citep{buizza2022data}. More recent work combines DA with learned priors or generative models, including sparse-observation weather DA \citep{manshausen2024generative}, derivative-free ensemble guidance for diffusion models \citep{zheng2024ensemble}, stochastic-interpolant DA \citep{chen2025flowdas}, and diffusion or flow-based perspectives on posterior correction and sequential warm starts \citep{hodyss2025using, scholz2025warm, huang2026accelerated}. These papers show that DA-style correction remains useful even when the predictive prior is highly expressive. However, they are not focused on video world models with retrieved visual observation memory. That gap is where our method sits.
 
 \section{Conclusion}
 
-This paper updates RGDA into a more focused conditioning-space formulation for TI2V continuation. The central object is a data-assimilated tokenizer: a small gain network that receives the native prompt-and-image conditioning token, a retrieved observation summary, and their innovation, then outputs a corrected continuation condition for the frozen Wan DiT. We specify the observation projection needed to map retrieved videos into TI2V space, define a frozen-backbone diffusion training objective, and provide a concrete training plan using OpenVid-1M for retrieval and MSR-VTT for supervised continuation. This gives the project a clear next step: implement the cached retrieval pipeline, train the gain network, and evaluate whether conditioning-space data assimilation improves later-half video continuation without fine-tuning the full generator.
+This paper reframes retrieval-guided Video-as-Prompt inference as a data-assimilation process for observation-aware video world models. The central object is the interaction between forecast tokens and the single retrieved real-video observation token sequence inside the existing DiT in-context pathway. We specify how retrieval supplies one observation trajectory from world memory, how the retrieved clip becomes a reference-video observation, and how the resulting token interaction can be read as a forecast--observation--analysis update for noise prediction and dynamics scoring. The Moving MNIST study provides an initial controlled check that this DA decomposition can improve dynamical rollout quality when observations are available. The six-case qualitative pilot then shows the practical promise and limitations of the retrieved-video path: it can increase dynamic motion, but can also introduce blur, layout drift, and extra runtime.
+
+\paragraph{Future work.}
+This draft is intended as a workshop or small-paper starting point, not a finished benchmark paper. The next steps are to run a controlled same-backbone comparison, replace the manually supplied reference clips with automatic LanguageBind retrieval from the cached OpenVid memory, evaluate more seeds and prompts, and add human or metric-based judgments of motion smoothness and physical consistency. A stronger implementation should also expose or tune the forecast-to-observation attention strength, reduce runtime, and test whether the attention update can retain the motion benefit while avoiding the spatial drift seen in the pilot.
 
 \bibliographystyle{plainnat}
 \bibliography{project_references}
