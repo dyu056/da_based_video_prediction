@@ -1,5 +1,7 @@
 import './styles.css';
 
+const mediaRoot = `${import.meta.env.BASE_URL}media`;
+
 const cases = [
   {
     id: 'basketball',
@@ -68,7 +70,7 @@ const slides = [
     type: 'concept',
     eyebrow: 'Problem',
     title: 'Image-to-video generation is an open-loop forecast',
-    image: '/media/assets/observation_analysis_paradigm_manual.png',
+    image: 'observation_analysis_paradigm_manual.png',
     points: [
       'The model receives one anchor image and a short prompt.',
       'It must roll out a plausible future scene from its learned prior.',
@@ -80,7 +82,7 @@ const slides = [
     type: 'concept',
     eyebrow: 'Paradigm',
     title: 'Retrieval becomes a sparse scene observation',
-    image: '/media/assets/method_analysis_embedded_manual.png',
+    image: 'method_analysis_embedded_manual.png',
     points: [
       'Forecast tokens come from the base image-to-video generator.',
       'Observation tokens come from one retrieved real-video trajectory.',
@@ -92,7 +94,7 @@ const slides = [
     type: 'concept',
     eyebrow: 'Evidence',
     title: 'A toy ETKF study checks the information claim',
-    image: '/media/assets/etkf_information_metrics.png',
+    image: 'etkf_information_metrics.png',
     points: [
       'Moving MNIST gives a controlled latent-state assimilation setting.',
       'Increasing ETKF ensemble size reduces the forecast-analysis information gap.',
@@ -108,7 +110,7 @@ const slides = [
     type: 'method',
     eyebrow: 'ML System',
     title: 'LanguageBind retrieval + Video-as-Prompt path',
-    image: '/media/assets/retrieval_vap_architecture_imagegen.png',
+    image: 'retrieval_vap_architecture_imagegen.png',
     points: [
       'OpenVid-style memory stores real videos and captions.',
       'LanguageBind embeds prompt, anchor image, and candidate video in one space.',
@@ -152,9 +154,13 @@ let isPlaying = false;
 const app = document.querySelector('#app');
 
 function mediaPath(slug, kind) {
-  if (kind === 'reference') return `/media/cases/${slug}/reference.mp4`;
-  if (kind === 'anchor') return `/media/cases/${slug}/anchor.png`;
-  return `/media/cases/${slug}/${kind}.mp4`;
+  if (kind === 'reference') return `${mediaRoot}/cases/${slug}/reference.mp4`;
+  if (kind === 'anchor') return `${mediaRoot}/cases/${slug}/anchor.png`;
+  return `${mediaRoot}/cases/${slug}/${kind}.mp4`;
+}
+
+function assetPath(fileName) {
+  return `${mediaRoot}/assets/${fileName}`;
 }
 
 function render() {
@@ -196,7 +202,7 @@ function renderSlide(slide) {
             <span>Analysis</span>
           </div>
         </div>
-        <img class="cover-image" src="/media/assets/intro_concept_imagegen.png" alt="Conceptual video world model illustration" />
+        <img class="cover-image" src="${assetPath('intro_concept_imagegen.png')}" alt="Conceptual video world model illustration" />
       </div>
     `;
   }
@@ -213,7 +219,7 @@ function renderSlide(slide) {
           ${slide.metrics ? renderMetrics(slide.metrics) : ''}
         </div>
         <figure class="figure-panel">
-          <img src="${slide.image}" alt="${slide.title}" />
+          <img src="${assetPath(slide.image)}" alt="${slide.title}" />
         </figure>
       </div>
     `;
@@ -235,7 +241,7 @@ function renderSlide(slide) {
           </article>
         `).join('')}
       </div>
-      <img class="wide-strip" src="/media/assets/qualitative_six_case_late_panel.png" alt="Six-case qualitative panel" />
+      <img class="wide-strip" src="${assetPath('qualitative_six_case_late_panel.png')}" alt="Six-case qualitative panel" />
     `;
   }
 

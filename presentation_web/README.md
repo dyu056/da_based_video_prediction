@@ -11,6 +11,14 @@ npm run dev -- --port 5173
 
 Open `http://127.0.0.1:5173/`.
 
+## Deployed site
+
+GitHub Pages URL:
+
+```text
+https://dyu056.github.io/da_based_video_prediction/
+```
+
 ## Controls
 
 - Left/right arrows: change slide
