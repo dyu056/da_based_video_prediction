@@ -67,38 +67,70 @@ const slides = [
     subtitle: 'Retrieval-guided data assimilation for image-to-video generation'
   },
   {
-    type: 'concept',
+    type: 'problemVideos',
     eyebrow: 'Problem',
-    title: 'Image-to-video generation is an open-loop forecast',
+    title: 'Short prompts leave motion under-specified',
+    lead: 'Image-to-video generators can preserve the first frame, but the event dynamics often remain too conservative when the prompt is short.',
+    points: [
+      'The model sees one anchor image and a compact text command.',
+      'Important latent variables are missing: contact timing, acceleration, camera flow, and background motion.',
+      'The result is visually stable but physically weak rollout.'
+    ],
+    videos: [
+      {
+        slug: 'a_basketball_player_shooting',
+        label: 'Basketball',
+        note: 'The shooting pose is clean, but the action barely develops.'
+      },
+      {
+        slug: 'a_surfer_riding_a_small_wave',
+        label: 'Surfing',
+        note: 'Wave, board, and camera motion remain moderate.'
+      },
+      {
+        slug: 'people_running_on_a_city_skywalk',
+        label: 'Running',
+        note: 'Foreground motion appears, while scene flow stays weak.'
+      }
+    ]
+  },
+  {
+    type: 'concept',
+    eyebrow: 'Motivation',
+    title: 'Video generation can be viewed as open-loop forecasting',
     image: 'observation_analysis_paradigm_manual.png',
     points: [
-      'The model receives one anchor image and a short prompt.',
-      'It must roll out a plausible future scene from its learned prior.',
-      'Short prompts omit timing, contact, acceleration, camera motion, and background flow.'
+      'The base generator is a strong learned prior over plausible videos.',
+      'But after rollout begins, there is no explicit update from real scene evidence.',
+      'Retrieval gives a lightweight way to bring empirical dynamics into the state.'
     ],
-    claim: 'The missing piece is an explicit observation update during rollout.'
+    claim: 'The core motivation is to turn retrieval from prompt context into a state-estimation signal.'
   },
   {
-    type: 'concept',
-    eyebrow: 'Paradigm',
-    title: 'Retrieval becomes a sparse scene observation',
-    image: 'method_analysis_embedded_manual.png',
+    type: 'formula',
+    eyebrow: 'Data Assimilation Formulation',
+    title: 'Forecast, observation, analysis',
     points: [
-      'Forecast tokens come from the base image-to-video generator.',
-      'Observation tokens come from one retrieved real-video trajectory.',
-      'The analysis state is the forecast representation after in-context fusion.'
+      ['Forecast', 'The open-loop latent video rollout from the image and prompt.'],
+      ['Observation', 'A retrieved real video that carries sparse scene dynamics.'],
+      ['Analysis', 'The corrected latent representation after fusing forecast and observation tokens.']
     ],
-    formula: 'zᵃₜ = Aθ(zᶠₜ, O, I, p)'
+    equations: [
+      'p(x_t | y_{1:t}) ∝ p(y_t | x_t) p(x_t | y_{1:t-1})',
+      'xᵃ = xᶠ + K(y - xᶠ),  K = Pᶠ / (Pᶠ + R)',
+      'zᵃₜ = Aθ(zᶠₜ, O, I, p)'
+    ],
+    explanation: 'We do not claim attention is an exact Kalman filter. The equations define the role of the components: the generator forecasts, retrieval observes, and the in-context pathway performs the learned analysis update.'
   },
   {
     type: 'concept',
-    eyebrow: 'Evidence',
-    title: 'A toy ETKF study checks the information claim',
+    eyebrow: 'Preliminary Test',
+    title: 'Moving MNIST checks whether observation closes the information gap',
     image: 'etkf_information_metrics.png',
     points: [
-      'Moving MNIST gives a controlled latent-state assimilation setting.',
-      'Increasing ETKF ensemble size reduces the forecast-analysis information gap.',
-      'This motivates attention as a tractable learned analysis operator for video DiTs.'
+      'A latent ETKF update is applied to a controlled Moving MNIST predictor.',
+      'If assimilation is working, the corrected analysis distribution should approach the observation-conditioned rollout.',
+      'The result supports the information claim before moving to video DiTs.'
     ],
     metrics: [
       ['8 members', '295.4926', '0.5709'],
@@ -108,13 +140,33 @@ const slides = [
   },
   {
     type: 'method',
-    eyebrow: 'ML System',
-    title: 'LanguageBind retrieval + Video-as-Prompt path',
-    image: 'retrieval_vap_architecture_imagegen.png',
+    eyebrow: 'Main Method',
+    title: 'Scene-assimilated analysis inside the video DiT',
+    image: 'method_analysis_embedded_manual.png',
     points: [
-      'OpenVid-style memory stores real videos and captions.',
-      'LanguageBind embeds prompt, anchor image, and candidate video in one space.',
-      'The in-context DiT branch fuses retrieved observation tokens with forecast tokens.'
+      'Forecast tokens come from the base image-to-video generator.',
+      'Observation tokens come from one retrieved real-video trajectory.',
+      'Forecast-side attention reads both streams, producing analysis tokens for denoising.'
+    ],
+    claim: 'The retrieved clip is not a target to copy; it is sparse evidence for under-specified dynamics.'
+  },
+  {
+    type: 'experiment',
+    eyebrow: 'Experimental Method',
+    title: 'Retrieval-guided Wan2.1 pilot',
+    image: 'retrieval_vap_architecture_imagegen.png',
+    steps: [
+      ['Query', 'Embed the anchor image and short prompt with LanguageBind.'],
+      ['Retrieve', 'Select one nearest OpenVid-style real clip as the observation trajectory.'],
+      ['Generate', 'Compare Wan2.1 image-to-video baseline with scene-assimilated inference.'],
+      ['Inspect', 'Use six prompt cases to analyze motion gains and spatial consistency costs.']
+    ],
+    settings: [
+      'Same prompt family and anchor-image setup',
+      'Baseline: image + prompt only',
+      'Ours: image + prompt + retrieved observation video',
+      'Qualitative focus: action phase, camera motion, background flow, identity drift',
+      'Implementation: LanguageBind retrieval + Video-as-Prompt in-context pathway'
     ]
   },
   {
@@ -124,14 +176,26 @@ const slides = [
     caseIndex: 0
   },
   {
-    type: 'summary',
-    eyebrow: 'Reading the cases',
-    title: 'Observation improves motion when retrieval is compatible',
+    type: 'discussion',
+    eyebrow: 'Discussion I',
+    title: 'What improves, and why?',
     columns: [
-      ['Motion gains', 'Follow-through, body-state transition, water motion, road flow, camera parallax.'],
-      ['Costs', 'Blur, subject drift, identity softening, framing instability when retrieval mismatches.'],
-      ['Criterion', 'A useful analysis update adds motion evidence without overwriting anchor-state variables.']
-    ]
+      ['Motion evidence', 'Retrieved clips provide contact timing, pose transition, camera parallax, and scene-level flow.'],
+      ['State-estimation view', 'The useful signal is not visual copying; it is correction of missing latent dynamics.'],
+      ['Best case', 'Retrieval is aligned in viewpoint, subject scale, background, and motion phase.']
+    ],
+    image: 'qualitative_six_case_late_panel.png'
+  },
+  {
+    type: 'discussion',
+    eyebrow: 'Discussion II',
+    title: 'What can go wrong?',
+    columns: [
+      ['Over-trust', 'A mismatched observation can add blur, identity drift, or framing instability.'],
+      ['Metric design', 'Motion quality must be reported together with spatial anchoring and physical consistency.'],
+      ['Next step', 'Add retrieval confidence, viewpoint filtering, and geometry-aware scene state.']
+    ],
+    image: 'observation_analysis_paradigm_manual.png'
   },
   {
     type: 'takeaways',
@@ -143,6 +207,12 @@ const slides = [
       'Treat in-context attention as a learned analysis operator.',
       'Evaluate retrieval as state estimation, not just as extra prompt context.'
     ]
+  },
+  {
+    type: 'qa',
+    eyebrow: 'Q and A',
+    title: 'Questions?',
+    subtitle: 'Scene-assimilated video world models: retrieval as observation, attention as analysis, generation as corrected forecasting.'
   }
 ];
 
@@ -186,6 +256,7 @@ function render() {
 
   bindDeckControls();
   if (slide.type === 'qualitative') bindQualitativeControls();
+  if (slide.type === 'problemVideos') bindProblemVideoControls();
 }
 
 function renderSlide(slide) {
@@ -205,6 +276,18 @@ function renderSlide(slide) {
         <img class="cover-image" src="${assetPath('intro_concept_imagegen.png')}" alt="Conceptual video world model illustration" />
       </div>
     `;
+  }
+
+  if (slide.type === 'problemVideos') {
+    return renderProblemVideos(slide);
+  }
+
+  if (slide.type === 'formula') {
+    return renderFormulaSlide(slide);
+  }
+
+  if (slide.type === 'experiment') {
+    return renderExperimentSlide(slide);
   }
 
   if (slide.type === 'concept' || slide.type === 'method') {
@@ -229,19 +312,35 @@ function renderSlide(slide) {
     return renderQualitativeSlide();
   }
 
-  if (slide.type === 'summary') {
+  if (slide.type === 'discussion') {
     return `
-      <p class="eyebrow">${slide.eyebrow}</p>
-      <h2>${slide.title}</h2>
-      <div class="summary-grid">
-        ${slide.columns.map(([heading, body]) => `
-          <article class="summary-card">
-            <h3>${heading}</h3>
-            <p>${body}</p>
-          </article>
-        `).join('')}
+      <div class="discussion-layout">
+        <div>
+          <p class="eyebrow">${slide.eyebrow}</p>
+          <h2>${slide.title}</h2>
+          <div class="summary-grid">
+            ${slide.columns.map(([heading, body]) => `
+              <article class="summary-card">
+                <h3>${heading}</h3>
+                <p>${body}</p>
+              </article>
+            `).join('')}
+          </div>
+        </div>
+        <figure class="figure-panel">
+          <img src="${assetPath(slide.image)}" alt="${slide.title}" />
+        </figure>
       </div>
-      <img class="wide-strip" src="${assetPath('qualitative_six_case_late_panel.png')}" alt="Six-case qualitative panel" />
+    `;
+  }
+
+  if (slide.type === 'qa') {
+    return `
+      <div class="qa-layout">
+        <p class="eyebrow">${slide.eyebrow}</p>
+        <h2>${slide.title}</h2>
+        <p>${slide.subtitle}</p>
+      </div>
     `;
   }
 
@@ -254,6 +353,79 @@ function renderSlide(slide) {
       </div>
       <div class="closing-card">
         Retrieval should be evaluated as an estimator: does aligned evidence close the missing-dynamics gap without overwriting image-conditioned state?
+      </div>
+    </div>
+  `;
+}
+
+function renderProblemVideos(slide) {
+  return `
+    <div class="problem-layout">
+      <div class="problem-copy">
+        <p class="eyebrow">${slide.eyebrow}</p>
+        <h2>${slide.title}</h2>
+        <p class="lead">${slide.lead}</p>
+        <ul class="point-list compact">${slide.points.map((point) => `<li>${point}</li>`).join('')}</ul>
+        <button class="control-button problem-play" data-action="problem-play">Play examples</button>
+      </div>
+      <div class="example-video-grid">
+        ${slide.videos.map((video) => `
+          <article class="video-panel baseline">
+            <div class="video-title"><span>${video.label}</span></div>
+            <video src="${mediaPath(video.slug, 'baseline')}" muted loop playsinline preload="metadata"></video>
+            <p>${video.note}</p>
+          </article>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderFormulaSlide(slide) {
+  return `
+    <div class="formula-layout">
+      <div>
+        <p class="eyebrow">${slide.eyebrow}</p>
+        <h2>${slide.title}</h2>
+        <div class="equation-stack">
+          ${slide.equations.map((equation) => `<div class="formula">${equation}</div>`).join('')}
+        </div>
+      </div>
+      <div class="formula-explain">
+        ${slide.points.map(([term, meaning]) => `
+          <article>
+            <h3>${term}</h3>
+            <p>${meaning}</p>
+          </article>
+        `).join('')}
+        <p class="claim">${slide.explanation}</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderExperimentSlide(slide) {
+  return `
+    <div class="experiment-layout">
+      <div>
+        <p class="eyebrow">${slide.eyebrow}</p>
+        <h2>${slide.title}</h2>
+        <div class="step-grid">
+          ${slide.steps.map(([label, body]) => `
+            <article class="step-card">
+              <span>${label}</span>
+              <p>${body}</p>
+            </article>
+          `).join('')}
+        </div>
+      </div>
+      <div>
+        <figure class="figure-panel compact-figure">
+          <img src="${assetPath(slide.image)}" alt="${slide.title}" />
+        </figure>
+        <ul class="settings-list">
+          ${slide.settings.map((setting) => `<li>${setting}</li>`).join('')}
+        </ul>
       </div>
     </div>
   `;
@@ -317,6 +489,23 @@ function renderVideoPanel(title, kind, slug, note, accent) {
 function bindDeckControls() {
   app.querySelector('[data-action="prev"]').addEventListener('click', previousSlide);
   app.querySelector('[data-action="next"]').addEventListener('click', nextSlide);
+}
+
+function bindProblemVideoControls() {
+  const button = app.querySelector('[data-action="problem-play"]');
+  button.addEventListener('click', () => {
+    const videos = [...app.querySelectorAll('video')];
+    const shouldPlay = videos.some((video) => video.paused);
+    videos.forEach((video) => {
+      if (shouldPlay) {
+        video.currentTime = 0;
+        video.play();
+      } else {
+        video.pause();
+      }
+    });
+    button.textContent = shouldPlay ? 'Pause examples' : 'Play examples';
+  });
 }
 
 function bindQualitativeControls() {
