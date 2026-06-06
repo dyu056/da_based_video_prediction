@@ -80,16 +80,19 @@ const slides = [
       {
         slug: 'a_basketball_player_shooting',
         label: 'Basketball',
+        prompt: 'A basketball player shooting',
         note: 'The shooting pose is clean, but the action barely develops.'
       },
       {
         slug: 'a_surfer_riding_a_small_wave',
         label: 'Surfing',
+        prompt: 'A surfer riding a small wave',
         note: 'Wave, board, and camera motion remain moderate.'
       },
       {
         slug: 'people_running_on_a_city_skywalk',
         label: 'Running',
+        prompt: 'People running on a city skywalk',
         note: 'Foreground motion appears, while scene flow stays weak.'
       }
     ]
@@ -366,12 +369,20 @@ function renderProblemVideos(slide) {
         <h2>${slide.title}</h2>
         <p class="lead">${slide.lead}</p>
         <ul class="point-list compact">${slide.points.map((point) => `<li>${point}</li>`).join('')}</ul>
+        <div class="prompt-list">
+          ${slide.videos.map((video) => `
+            <p><span>${video.label}</span>${video.prompt}</p>
+          `).join('')}
+        </div>
         <button class="control-button problem-play" data-action="problem-play">Play examples</button>
       </div>
       <div class="example-video-grid">
         ${slide.videos.map((video) => `
           <article class="video-panel baseline">
-            <div class="video-title"><span>${video.label}</span></div>
+            <div class="video-title problem-title">
+              <span>${video.label}</span>
+              <em>Prompt: ${video.prompt}</em>
+            </div>
             <video src="${mediaPath(video.slug, 'baseline')}" muted loop playsinline preload="metadata"></video>
             <p>${video.note}</p>
           </article>
