@@ -151,6 +151,7 @@ h3 {
 .takeaway-layout,
 .problem-layout,
 .formula-layout,
+.metric-layout,
 .experiment-layout,
 .discussion-layout {
   display: grid;
@@ -231,8 +232,21 @@ h3 {
 .formula {
   background: #edf6f5;
   color: #0d605b;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-weight: 800;
+  overflow-x: auto;
+}
+
+.math-block {
+  font-size: clamp(18px, 1.65vw, 25px);
+}
+
+.math-block .katex-display {
+  margin: 0;
+}
+
+.math-block .katex {
+  font-size: 1em;
+  white-space: nowrap;
 }
 
 .equation-stack {
@@ -269,6 +283,48 @@ h3 {
   margin: 0;
   color: #33414d;
   font-size: 18px;
+}
+
+.metric-layout {
+  grid-template-columns: minmax(0, 0.78fr) minmax(420px, 1.22fr);
+  align-items: start;
+}
+
+.metric-copy {
+  min-width: 0;
+}
+
+.metric-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.metric-card {
+  min-width: 0;
+  padding: 18px 20px;
+  border: 1px solid #d7e2e7;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.metric-card h3 {
+  margin-bottom: 10px;
+  color: #2467a8;
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.metric-card .formula {
+  margin-top: 0;
+  padding: 14px 16px;
+}
+
+.metric-card p {
+  margin: 12px 0 0;
+  color: #33414d;
+  font-size: clamp(16px, 1.35vw, 19px);
 }
 
 .problem-copy {
@@ -679,13 +735,84 @@ video {
   .split,
   .takeaway-layout,
   .problem-layout,
-  .formula-layout,
   .experiment-layout,
   .discussion-layout,
   .qual-header,
   .comparison-grid,
   .summary-grid {
     grid-template-columns: 1fr;
+  }
+
+  .formula-layout {
+    grid-template-columns: minmax(0, 0.95fr) minmax(280px, 1.05fr);
+    gap: 16px;
+  }
+
+  .formula-layout h2 {
+    font-size: clamp(30px, 5vw, 42px);
+  }
+
+  .formula-layout .math-block,
+  .metric-layout .math-block {
+    font-size: 16px;
+  }
+
+  .formula,
+  .claim {
+    margin-top: 16px;
+    padding: 13px 15px;
+  }
+
+  .formula-explain {
+    gap: 9px;
+  }
+
+  .formula-explain article {
+    padding: 12px 14px;
+  }
+
+  .formula-explain p {
+    font-size: 15px;
+  }
+
+  .metric-layout {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .metric-layout h2 {
+    margin-bottom: 10px;
+    font-size: clamp(30px, 5vw, 42px);
+  }
+
+  .metric-layout .lead {
+    font-size: 18px;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .metric-card {
+    padding: 12px 14px;
+  }
+
+  .metric-card h3 {
+    margin-bottom: 8px;
+    font-size: 14px;
+  }
+
+  .metric-card .formula {
+    padding: 10px 12px;
+  }
+
+  .metric-card p {
+    font-size: 14px;
+  }
+
+  .metric-card:nth-child(3) {
+    grid-column: 1 / -1;
   }
 
   .example-video-grid .video-panel,
@@ -717,5 +844,17 @@ video {
 
   .wide-strip {
     width: 100%;
+  }
+}
+
+@media (max-width: 640px) {
+  .formula-layout,
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .formula-layout .math-block,
+  .metric-layout .math-block {
+    font-size: 15px;
   }
 }

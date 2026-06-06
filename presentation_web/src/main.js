@@ -1,3 +1,5 @@
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
 import './styles.css';
 
 const mediaRoot = `${import.meta.env.BASE_URL}media`;
@@ -119,11 +121,34 @@ const slides = [
       ['Analysis', 'The corrected latent representation after fusing forecast and observation tokens.']
     ],
     equations: [
-      'p(x_t | y_{1:t}) ∝ p(y_t | x_t) p(x_t | y_{1:t-1})',
-      'xᵃ = xᶠ + K(y - xᶠ),  K = Pᶠ / (Pᶠ + R)',
-      'zᵃₜ = Aθ(zᶠₜ, O, I, p)'
+      String.raw`p(x_t \mid y_{1:t}) \propto p(y_t \mid x_t)\,p(x_t \mid y_{1:t-1})`,
+      String.raw`x^{a}=x^{f}+K(y-x^{f}),\qquad K=\frac{P^{f}}{P^{f}+R}`,
+      String.raw`z_t^{a}=\mathcal{A}_{\theta}\!\left(z_t^{f}, O, I, p\right)`
     ],
     explanation: 'We do not claim attention is an exact Kalman filter. The equations define the role of the components: the generator forecasts, retrieval observes, and the in-context pathway performs the learned analysis update.'
+  },
+  {
+    type: 'metricMath',
+    eyebrow: 'Key Metrics',
+    title: 'Measuring the remaining information gap',
+    lead: 'The preliminary test asks whether the analysis state becomes closer to the observation-conditioned state after assimilation.',
+    metrics: [
+      {
+        label: 'Relative entropy',
+        equation: String.raw`D_{\mathrm{KL}}\!\left(p_a \,\|\, p_f\right)=\int p_a(z)\log\frac{p_a(z)}{p_f(z)}\,dz`,
+        text: 'Compares the analysis distribution with the forecast distribution. A smaller post-update gap means the forecast has moved toward the observation-compatible state.'
+      },
+      {
+        label: 'Mutual information',
+        equation: String.raw`\begin{aligned}I(Z;Y)&=H(Z)-H(Z\mid Y)\\&=\mathbb{E}_{p(z,y)}\!\left[\log\frac{p(z,y)}{p(z)p(y)}\right]\end{aligned}`,
+        text: 'Measures how much uncertainty about latent state Z is explained by observation Y. Lower residual information means less missing dynamics remain.'
+      },
+      {
+        label: 'Analysis reading',
+        equation: String.raw`p_f(z)\longrightarrow p_a(z)=p(z\mid Y)`,
+        text: 'The goal is not to copy the retrieved video. The goal is to correct under-specified motion while preserving the image-conditioned anchor state.'
+      }
+    ]
   },
   {
     type: 'concept',
@@ -236,6 +261,14 @@ function assetPath(fileName) {
   return `${mediaRoot}/assets/${fileName}`;
 }
 
+function math(tex, displayMode = true) {
+  return katex.renderToString(tex, {
+    displayMode,
+    throwOnError: false,
+    strict: 'ignore'
+  });
+}
+
 function render() {
   const slide = slides[currentSlide];
   app.innerHTML = `
@@ -287,6 +320,10 @@ function renderSlide(slide) {
 
   if (slide.type === 'formula') {
     return renderFormulaSlide(slide);
+  }
+
+  if (slide.type === 'metricMath') {
+    return renderMetricMathSlide(slide);
   }
 
   if (slide.type === 'experiment') {
@@ -399,7 +436,7 @@ function renderFormulaSlide(slide) {
         <p class="eyebrow">${slide.eyebrow}</p>
         <h2>${slide.title}</h2>
         <div class="equation-stack">
-          ${slide.equations.map((equation) => `<div class="formula">${equation}</div>`).join('')}
+          ${slide.equations.map((equation) => `<div class="formula math-block">${math(equation)}</div>`).join('')}
         </div>
       </div>
       <div class="formula-explain">
@@ -410,6 +447,27 @@ function renderFormulaSlide(slide) {
           </article>
         `).join('')}
         <p class="claim">${slide.explanation}</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderMetricMathSlide(slide) {
+  return `
+    <div class="metric-layout">
+      <div class="metric-copy">
+        <p class="eyebrow">${slide.eyebrow}</p>
+        <h2>${slide.title}</h2>
+        <p class="lead">${slide.lead}</p>
+      </div>
+      <div class="metric-grid">
+        ${slide.metrics.map((metric) => `
+          <article class="metric-card">
+            <h3>${metric.label}</h3>
+            <div class="formula math-block">${math(metric.equation)}</div>
+            <p>${metric.text}</p>
+          </article>
+        `).join('')}
       </div>
     </div>
   `;
