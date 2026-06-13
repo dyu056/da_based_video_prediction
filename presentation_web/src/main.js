@@ -198,6 +198,32 @@ const slides = [
     ]
   },
   {
+    type: 'trainingDetails',
+    eyebrow: 'Training Details',
+    title: 'Dataset and loss function',
+    dataset: {
+      heading: 'Dataset / observation memory',
+      equation: String.raw`\mathcal{R}=\{(r_i,c_i)\}_{i=1}^{N}`,
+      points: [
+        'OpenVid-1M style real-video clips form the external observation memory.',
+        'Each candidate clip is cached with LanguageBind caption and video embeddings.',
+        'For each target clip x=(x_1,...,x_T), use I=x_1 as the anchor image and caption p as the prompt.',
+        'Retrieve one non-identical clip r* with caption c* to provide scene dynamics rather than ground-truth frames.'
+      ]
+    },
+    loss: {
+      heading: 'Conditional diffusion objective',
+      equation: String.raw`\mathcal{L}_{\mathrm{ft}}=\mathbb{E}_{x,I,p,r^\star,c^\star,t,\epsilon}\left[\left\|\epsilon-\epsilon_{\theta}(z_t,t,I,p,r^\star,c^\star)\right\|_2^2\right]`,
+      points: [
+        'Target clip supplies the supervised denoising trajectory.',
+        'Retrieved clip supplies the observation stream used by the in-context branch.',
+        'Base image-to-video DiT, VAE, and text encoder stay frozen.',
+        'Only the retrieval-guided in-context pathway is fine-tuned.'
+      ]
+    },
+    note: 'The loss trains the analysis pathway to use real-video evidence without turning the retrieved clip into a direct reconstruction target.'
+  },
+  {
     type: 'qualitative',
     eyebrow: 'Qualitative Analysis',
     title: 'Side-by-side video comparison',
@@ -328,6 +354,10 @@ function renderSlide(slide) {
 
   if (slide.type === 'experiment') {
     return renderExperimentSlide(slide);
+  }
+
+  if (slide.type === 'trainingDetails') {
+    return renderTrainingDetailsSlide(slide);
   }
 
   if (slide.type === 'concept' || slide.type === 'method') {
@@ -497,6 +527,33 @@ function renderExperimentSlide(slide) {
         </ul>
       </div>
     </div>
+  `;
+}
+
+function renderTrainingDetailsSlide(slide) {
+  return `
+    <div class="training-layout">
+      <div class="training-copy">
+        <p class="eyebrow">${slide.eyebrow}</p>
+        <h2>${slide.title}</h2>
+        <p class="lead">Before qualitative results, we make explicit what data provides supervision and what objective trains the analysis pathway.</p>
+        <p class="claim">${slide.note}</p>
+      </div>
+      <div class="training-grid">
+        ${renderTrainingCard(slide.dataset)}
+        ${renderTrainingCard(slide.loss)}
+      </div>
+    </div>
+  `;
+}
+
+function renderTrainingCard(section) {
+  return `
+    <article class="training-card">
+      <h3>${section.heading}</h3>
+      <div class="formula math-block">${math(section.equation)}</div>
+      <ul class="point-list compact">${section.points.map((point) => `<li>${point}</li>`).join('')}</ul>
+    </article>
   `;
 }
 
